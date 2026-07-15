@@ -1,0 +1,7 @@
+.vscode
+
+# colcon / cmake artefacts
+build/
+install/
+log/
+compile_commands.json
