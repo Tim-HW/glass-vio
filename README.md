@@ -11,6 +11,17 @@ reprojection residual**. One solver, two sensors, zero copied Jacobians.
 > subtly-wrong Jacobian can sink a LiDAR odometry and a visual one, it should live in one
 > place, tested once — not copy-pasted and left to drift.
 
+## Docs
+
+Like glass-lio, this repo is written to be **read**.
+
+- **[doc/preintegration.md](doc/preintegration.md)** — how the IMU factor's engine room
+  actually works: what one `integrate()` call does, the **ordering discipline** that
+  separates a correct estimator from a plausible-looking wrong one, why the noise density
+  is *divided* by `Δt`, and what the KITTI dead-reckon check does and does not prove.
+  Complements glass-lio's [§7.4](../glasslio/doc/7-tight-coupling.md), which covers *why*
+  preintegration exists; this covers *how*.
+
 ## Status
 
 **Early skeleton.** What runs today:
