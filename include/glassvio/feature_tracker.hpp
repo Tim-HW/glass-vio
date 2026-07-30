@@ -52,8 +52,18 @@ public:
       std::vector<long> tracked_ids;
       flow(prev_gray_, gray, prev_pts_, ids_, tracked, tracked_ids);
 
-      // Top up only when we have drifted below the floor -- re-detecting every frame would
-      // churn ids and defeat the point of tracking.
+      // Top up only once the survivors fall below the floor. Re-detecting EVERY frame was
+      // tried and MEASURABLY broke structure-from-motion: sfm_check's rigidity residual at
+      // EuRoC window 100 went from 2.64% to 76%, and the bootstrap reconstructed the room at
+      // ~3 cm instead of metres. The exact mechanism is still open (detectInto appends, so it
+      // does not churn ids), but the empirical result is unambiguous, deterministic, and the
+      // same tracked frames feed SfM -- so the corruption here is the corruption there.
+      //
+      // The sliding-window map does need a supply of young tracks, and gating starves it
+      // (~13 pending against ~11 landmarks lost per frame). That is a real problem, but the
+      // fix is NOT here -- it is a higher floor or a map-driven re-detect that leaves the
+      // reconstruction's tracks intact. Supply the map without breaking the geometry it is
+      // built on.
       if (tracked.size() < static_cast<std::size_t>(min_features_)) {
         detectInto(gray, tracked, tracked_ids);
       }

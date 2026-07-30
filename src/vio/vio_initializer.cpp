@@ -172,6 +172,25 @@ bool VioInitializer::align(
 
   out.gravity_sfm = x.segment<3>(gi);
   out.scale = x(si);
+
+  // SCALE OBSERVABILITY, the SUFFICIENT test the sign check is not. Scale reaches the solve
+  // only through the accelerometer's non-gravity part, so a window without excitation leaves s
+  // poorly determined -- positive but metrically meaningless (measured on EuRoC: a starved
+  // window gave a 3 cm room). The MARGINAL RELATIVE UNCERTAINTY of s is what detects this:
+  //
+  //     cov(x) = sigma^2 (A^T A)^-1 ,   sigma_s / |s| = how uncertain the scale is, as a fraction
+  //
+  // Marginal (not the raw diagonal) because it accounts for s trading off against v and g --
+  // the exact ridge that lets a bad window fake a fit. Dimensionless, so it needs no
+  // per-dataset threshold. The raw condition number of A does NOT work here: its columns span
+  // dt, dt^2 and ruler units, so its conditioning measures column scaling, not observability.
+  const Eigen::VectorXd resid = A * x - b;
+  const int dof = std::max(1, row - dim);
+  const double sigma2 = resid.squaredNorm() / static_cast<double>(dof);
+  const Eigen::MatrixXd N_inv = (A.transpose() * A).inverse();
+  const double var_s = sigma2 * N_inv(si, si);
+  out.scale_uncertainty =
+    std::sqrt(std::max(0.0, var_s)) / std::max(std::abs(out.scale), 1e-9);
   out.velocity_sfm.clear();
   for (int a = 0; a < n; ++a) {
     out.velocity_sfm.push_back(x.segment<3>(3 * a));
@@ -201,7 +220,11 @@ bool VioInitializer::align(
   // This is necessary, not sufficient: it catches the gross degeneracy, not a mildly
   // ill-conditioned one. |g| is no help here -- on KITTI it landed within 0.8% while s was
   // 108% wrong, because gravity is observable from the dv equations whether or not scale is.
-  out.scale_observable = out.scale > 0.0;
+  // Sign (necessary) AND relative uncertainty (sufficient). The sign catches the gross ridge
+  // failure (negative baseline); the uncertainty catches the subtle one -- a positive but
+  // poorly-excited scale, which is what silently gave a 3 cm room online.
+  out.scale_observable =
+    out.scale > 0.0 && out.scale_uncertainty < p_.max_scale_uncertainty;
   return true;
 }
 
@@ -226,7 +249,14 @@ InitResult VioInitializer::run(
 
   // [3] Gyro bias. Rotations are scale-free, so this is observable before the metre exists
   //     -- and it goes before [4] because [4] integrates the gyro.
-  if (!estimateGyroBias(frames, imu, begin, out.gyro_bias, out.bias_pairs)) {
+  //
+  // FROM 0, NOT `begin`. `begin` is stage [2]'s window -- deliberately the NEWEST frames, so
+  // its landmarks are alive. The bias is a CONSTANT of the sensor, so every frame in the
+  // stream is evidence and averaging is what pulls it below the vision noise floor of any one
+  // pair (~0.28 deg). Passing `begin` here would hand it only the reconstruction's 30 frames,
+  // i.e. 6 pairs against a required 8 -- which is exactly how the online node stalled forever
+  // while the offline checks, loading whole bags, never noticed.
+  if (!estimateGyroBias(frames, imu, 0, out.gyro_bias, out.bias_pairs)) {
     return out;
   }
 

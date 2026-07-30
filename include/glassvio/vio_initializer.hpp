@@ -52,6 +52,12 @@ struct InitializerParams
   /// |g| is never constrained in the solve, so how far it lands from 9.80665 is a direct
   /// test of the formulation, the frames, and the extrinsic. Above this, refuse.
   double max_gravity_error_pct = 5.0;
+  /// The SUFFICIENT scale gate: reject a window whose scale is uncertain by more than this
+  /// fraction (sigma_s / |s|). This is what turns the standing KITTI lesson -- scale needs
+  /// excitation -- into a real gate, and it is what lets the estimator retry past a
+  /// poorly-excited window instead of bootstrapping at a metrically-wrong scale. Measured on
+  /// EuRoC V1_01: good windows ~0.02-0.10, degenerate ones 0.2-0.56.
+  double max_scale_uncertainty = 0.15;
 };
 
 /// What the bootstrap produced. Everything spatial is in the SFM FRAME -- the base camera --
@@ -78,6 +84,10 @@ struct InitResult
   Eigen::Vector3d gravity_sfm = Eigen::Vector3d::Zero();
   /// [4] metres per ruler unit: what the base pair's invented |t| = 1 was really worth.
   double scale = 0.0;
+  /// Marginal RELATIVE uncertainty of the scale, sigma_s / |s|. Large = scale poorly excited =
+  /// s unreliable even when positive. The sufficient half of scale_observable, and
+  /// dimensionless so it needs no per-dataset threshold.
+  double scale_uncertainty = 0.0;
   /// [4] The frames the alignment solved for, sorted, and their velocities in the SfM frame.
   std::vector<int> frames;
   std::vector<Eigen::Vector3d> velocity_sfm;

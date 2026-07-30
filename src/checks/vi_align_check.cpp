@@ -100,6 +100,7 @@ int main(int argc, char ** argv)
     r.sfm.base, r.sfm.second, r.sfm.base_parallax_px, r.sfm.landmark.size(),
     r.sfm.pose.size(), r.gyro_bias.x(), r.gyro_bias.y(), r.gyro_bias.z(), r.bias_pairs,
     r.align_intervals);
+  std::printf("[4] scale rel. uncertainty: %.3f (large = poorly excited)\n", r.scale_uncertainty);
   if (r.frames.empty()) {
     std::fprintf(stderr, "stage [4] failed outright\n");
     return 2;

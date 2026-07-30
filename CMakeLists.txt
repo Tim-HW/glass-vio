@@ -44,7 +44,8 @@ add_subdirectory("${GLASS_CORE_DIR}" glass_core)
 add_library(vio
   src/vio/vio_initializer.cpp
   src/vio/visual_registration.cpp
-  src/vio/vio_estimator.cpp)
+  src/vio/vio_estimator.cpp
+  src/vio/landmark_map.cpp)
 target_include_directories(vio PUBLIC include)
 ament_target_dependencies(vio
   rclcpp sensor_msgs geometry_msgs rosbag2_cpp cv_bridge OpenCV)
@@ -116,7 +117,14 @@ target_include_directories(vio_check PRIVATE include)
 ament_target_dependencies(vio_check rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
 target_link_libraries(vio_check vio)
 
-install(TARGETS vio glassvio_node imu_dead_reckon_check epipolar_check gyro_bias_check sfm_check vi_align_check vio_check
+# Deterministic offline drive of the real VioEstimator -- splits "the node fails" into
+# whether bootstrap()'s LOGIC or the online plumbing is at fault.
+add_executable(estimator_check src/checks/estimator_check.cpp)
+target_include_directories(estimator_check PRIVATE include)
+ament_target_dependencies(estimator_check rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
+target_link_libraries(estimator_check vio)
+
+install(TARGETS vio glassvio_node imu_dead_reckon_check epipolar_check gyro_bias_check sfm_check vi_align_check vio_check estimator_check
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)

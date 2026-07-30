@@ -2,6 +2,7 @@
 #define GLASSVIO_VIO_ESTIMATOR_HPP
 
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -10,6 +11,7 @@
 
 #include "glassvio/camera_calib.hpp"
 #include "glassvio/dataset.hpp"
+#include "glassvio/landmark_map.hpp"
 #include "glassvio/types.hpp"
 #include "glassvio/vio_initializer.hpp"
 #include "glassvio/visual_registration.hpp"
@@ -21,9 +23,37 @@ using namespace glass_core;  // NOLINT(build/namespaces)
 
 struct EstimatorParams
 {
-  /// Frames to collect before attempting the bootstrap. Must be enough for stage [2] to find
-  /// a base pair with real parallax; 30 is ~1.5 s at EuRoC's 20 Hz.
-  int bootstrap_frames = 30;
+  /// Frames COLLECTED before attempting the bootstrap. Deliberately NOT the same as
+  /// init.window_frames, and tying them together is a bug that has now been made three times
+  /// in this project.
+  ///
+  /// Stage [2] wants a SHORT window -- landmarks die as the camera moves, so a long one
+  /// reconstructs nothing. Stage [3] wants a LONG one -- the gyro bias is a constant of the
+  /// sensor, so every pair is evidence, and averaging is what pulls the estimate below the
+  /// vision noise floor of any single pair (~0.28 deg on EuRoC).
+  ///
+  /// At bias_frame_gap = 5, N collected frames yield (N - 5) / 5 pairs. 30 frames gives 5 --
+  /// below bias_min_pairs = 8, so stage [3] failed, run() bailed, and the node collected
+  /// forever. 50 gives 9. The offline checks never saw this because they load the whole bag,
+  /// so "scan to the end of the stream" silently meant 2912 frames; online, the end is now.
+  int bootstrap_frames = 120;
+  /// Frames between bootstrap ATTEMPTS. An attempt is a full SfM plus ~10 essential matrices;
+  /// running one per frame starved the worker and made the queue drop groups. A slid window
+  /// shares all but one frame with the last attempt, so retrying immediately re-asks a
+  /// question whose answer cannot have changed.
+  int bootstrap_retry_every = 5;
+  /// Frames the tracker may COAST on the IMU prediction when the visual solve is
+  /// under-constrained, before declaring LOST. Its job is the post-bootstrap hole: the
+  /// expensive bootstrap drops frames, KLT ids churn, and the map needs a few frames of
+  /// baseline to re-triangulate against live ids. Dead reckoning is good to 0.16 m / 2 s, so a
+  /// short coast is cheap; replenished on every successful solve, so it also rides out a
+  /// transient dip (a blank wall, a hard turn).
+  int warmup_frames = 20;
+  /// THE SLIDING WINDOW. Landmarks are maintained rather than frozen: triangulated as tracks
+  /// mature against the (metric) state, dropped when they leave view or stop fitting. Without
+  /// it, tracking starved after ~4 s with 0 landmarks in view -- measured, not predicted.
+  LandmarkMapParams map;
+  /// Stage [2]'s window is a SUBSET of what is collected. Leave it short.
   InitializerParams init;
   VisualParams visual;
 
@@ -83,13 +113,33 @@ public:
   void reset();
 
   bool initialized() const {return initialized_;}
+  /// Why the last bootstrap attempt failed, by STAGE. Empty when it succeeded. A bare bool
+  /// here left the node logging "collecting..." forever with the reason invisible.
+  const std::string & lastFailure() const {return last_failure_;}
+  int lastLandmarks() const {return last_landmarks_;}
+  int lastBiasPairs() const {return last_bias_pairs_;}
   const NavState & state() const {return x_;}
-  /// Landmarks, metric, in the world frame. Fixed once the bootstrap sets them -- which is
-  /// why tracking starves after ~2.5 s and a sliding window is the next thing.
-  const std::unordered_map<long, Eigen::Vector3d> & landmarks() const {return landmarks_;}
+  /// Landmarks, metric, in the world frame. Maintained by LandmarkMap: fixed WITHIN a solve
+  /// (that is what keeps the state at 15 DoF), but grown and pruned between them.
+  const std::unordered_map<long, Eigen::Vector3d> & landmarks() const
+  {
+    return map_->landmarks();
+  }
+  const LandmarkMap & map() const {return *map_;}
 
 private:
   bool bootstrap();
+
+  /// Pose from vision alone: PnP the current frame's observed landmarks against the metric
+  /// map. This is what closes the bootstrap latency gap. The bootstrap runs on the worker
+  /// while the queue drops ~1 s of frames, so the first tracking frame is ~1 s after the
+  /// anchor -- and predictState dead-reckoning across that whole hole lands badly enough to
+  /// push near-field landmarks behind the camera (measured: 64 matched, 0 pass cheirality).
+  /// PnP needs no previous pose and no time base, so it is immune to the gap: it reads the
+  /// pose straight off the 3D-2D correspondences. Fills only R and p; v and the biases stay
+  /// with predictState, which PnP cannot see. False if too few inliers.
+  bool pnpFromMap(
+    const std::unordered_map<long, cv::Point2f> & obs, NavState & out) const;
 
   CameraCalib calib_;
   EstimatorParams p_;
@@ -107,8 +157,13 @@ private:
     Eigen::Matrix<double, kNavDim, kNavDim>::Zero();
   Eigen::Matrix<double, 6, 6> bias_information_ = Eigen::Matrix<double, 6, 6>::Identity();
   Eigen::Vector3d gravity_world_{0.0, 0.0, -kGravity};
-  std::unordered_map<long, Eigen::Vector3d> landmarks_;
+  std::unique_ptr<LandmarkMap> map_;
   double t_prev_ = 0.0;
+  std::string last_failure_;
+  int last_landmarks_ = 0;
+  int last_bias_pairs_ = 0;
+  int since_attempt_ = 0;
+  int warmup_ = 0;
 };
 
 }  // namespace glassvio

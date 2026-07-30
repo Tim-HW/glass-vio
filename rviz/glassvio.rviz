@@ -1,0 +1,106 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Odometry1
+        - /Features1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+      Color: 160; 160; 164
+      Alpha: 0.3
+      Reference Frame: <Fixed Frame>
+
+    # The world frame the estimator DEFINED: origin at the first body pose, +Z along measured
+    # gravity, yaw arbitrary. Gravity constrains two of three rotational DoF; nothing observes
+    # the third, so the grid's heading is meaningless by construction -- not a bug to chase.
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Marker Scale: 0.5
+      Frame Timeout: 15
+
+    # The trajectory. Keep is large because the interesting part is the SHAPE over time --
+    # a monocular VIO with fixed landmarks starves after ~2.5 s, and you want to see where.
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Enabled: true
+      Topic:
+        Value: /glassvio_node/odom
+        Depth: 200
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Keep: 500
+      Position Tolerance: 0.01
+      Angle Tolerance: 0.01
+      Shape:
+        Value: Arrow
+        Alpha: 1
+        Color: 255; 85; 0
+        Shaft Length: 0.08
+        Shaft Radius: 0.01
+        Head Length: 0.04
+        Head Radius: 0.02
+      Covariance:
+        Value: false
+
+    # FAST + KLT tracks, drawn green on the raw frame. Watch the COUNT: when it collapses the
+    # solve is about to starve, which is the fixed-landmark limitation rather than a failure.
+    - Class: rviz_default_plugins/Image
+      Name: Features
+      Enabled: true
+      Topic:
+        Value: /glassvio_node/features
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Normalize Range: true
+
+  Enabled: true
+  Global Options:
+    # The estimator publishes odom -> imu. Anything else here shows an empty scene.
+    Fixed Frame: odom
+    Background Color: 48; 48; 48
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.6
+      Yaw: 2.4
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz)
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Features:
+    collapsed: false
+  Height: 900
+  Width: 1400
+  QMainWindow State: 000000ff00000000fd0000000400000000000001f30000031efc0200000002fb000000100044006900730070006c00610079007301000000270000031e000000c700fffffffb0000001200460065006100740075007200650073010000034b000000c70000000000000000000000010000010f0000031efc0200000001fb0000001200460065006100740075007200650073010000002700000318000000a700ffffff000004b60000031e00000004000000040000000800000008fc00000002000000020000000000000002000000000000000000000000

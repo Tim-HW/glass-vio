@@ -5,3 +5,7 @@ build/
 install/
 log/
 compile_commands.json
+
+# python bytecode (launch files)
+__pycache__/
+*.pyc

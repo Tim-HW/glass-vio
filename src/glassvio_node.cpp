@@ -105,8 +105,12 @@ public:
     tracker_ = std::make_unique<FeatureTracker>(max_features, min_features, fast_threshold);
 
     EstimatorParams ep;
-    ep.bootstrap_frames = declare_parameter<int>("bootstrap_frames", 30);
-    ep.init.window_frames = ep.bootstrap_frames;
+    // TWO SPANS, NOT ONE. `bootstrap_frames` is how much to collect (stage [3]'s bias wants
+    // as many pairs as it can get); `sfm_window_frames` is stage [2]'s reconstruction window,
+    // which must stay short or its landmarks die. Setting them equal starves the bias solve --
+    // see EstimatorParams::bootstrap_frames.
+    ep.bootstrap_frames = declare_parameter<int>("bootstrap_frames", 120);
+    ep.init.window_frames = declare_parameter<int>("sfm_window_frames", 30);
     estimator_ = std::make_unique<VioEstimator>(calib_, ep);
 
     // Bounded: if the worker falls behind, drop the OLDEST group rather than let latency grow
@@ -220,7 +224,7 @@ private:
   void enqueueReady()
   {
     MeasureGroup group;
-    for (;;) {
+    for (;; ) {
       {
         std::lock_guard<std::mutex> lock(buf_mutex_);
         if (!sync_.next(group)) {
@@ -231,10 +235,24 @@ private:
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.push_back(std::move(group));
         if (queue_.size() > max_queue_) {
+          // DROP THE FRAME, KEEP ITS IMU. glasslio can discard a whole MeasureGroup because a
+          // dropped scan is simply a missed measurement -- ICP re-registers the next one
+          // against the map. Here the IMU is a CHAIN: each group carries [t_prev, t_cur], and
+          // losing one punches a hole that preintegration must then refuse to cross
+          // (ImuBuffer's gap check fires, and rightly). Splicing the samples onto the next
+          // group keeps the chain unbroken while still dropping the expensive part -- the
+          // frame's observations.
+          //
+          // The boundary sample ends up duplicated (both groups hold the one at t_cur), which
+          // is harmless: it yields dt = 0 and integrate() returns early on that.
+          MeasureGroup dropped = std::move(queue_.front());
           queue_.pop_front();
+          auto & next = queue_.front();
+          next.imu.insert(next.imu.begin(), dropped.imu.begin(), dropped.imu.end());
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "worker behind -- dropping oldest frame (queue %zu)", max_queue_);
+            "worker behind -- dropping oldest frame's observations, keeping its IMU "
+            "(queue %zu)", max_queue_);
         }
       }
       queue_cv_.notify_one();
@@ -247,7 +265,7 @@ private:
 
   void workerLoop()
   {
-    for (;;) {
+    for (;; ) {
       MeasureGroup group;
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -269,7 +287,11 @@ private:
     switch (r.stage) {
       case FrameResult::Stage::Collecting:
         RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000, "collecting frames for the bootstrap...");
+          get_logger(), *get_clock(), 2000, "collecting... last attempt: %s (%d landmarks, "
+          "%d bias pairs)",
+          estimator_->lastFailure().empty() ? "still filling the window" :
+          estimator_->lastFailure().c_str(),
+          estimator_->lastLandmarks(), estimator_->lastBiasPairs());
         return;
 
       case FrameResult::Stage::Bootstrapped:
@@ -287,15 +309,18 @@ private:
         // is what fixes this; a looser min_features would only hide it.
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "LOST -- landmarks starved (%d in view). Fixed landmarks cannot outlive the flight; "
-          "a sliding window is the fix.", r.features);
+          "LOST -- only %d landmarks in view. With the map maintained this means the tracker "
+          "lost the scene, not that we outlived a frozen set.", r.features);
         return;
 
       case FrameResult::Stage::Tracking:
         RCLCPP_INFO_THROTTLE(
           get_logger(), *get_clock(), 1000,
-          "tracking: %d landmarks, rmse %.2f px, |v| = %.2f m/s",
-          r.features, r.rmse_px, r.velocity.norm());
+          "tracking: %d/%zu landmarks, rmse %.2f px, |v| = %.2f m/s "
+          "| map: +%d -%d, %zu pending",
+          r.features, estimator_->map().size(), r.rmse_px, r.velocity.norm(),
+          estimator_->map().lastTriangulated(), estimator_->map().lastDropped(),
+          estimator_->map().pending());
         break;
     }
 

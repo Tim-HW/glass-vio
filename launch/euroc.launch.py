@@ -17,6 +17,7 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -24,6 +25,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BAG = os.path.join(HERE, 'data', 'vicon_room1', 'V1_01_easy', 'V1_01_easy_ros2')
 CALIB = os.path.join(HERE, 'config')
+RVIZ = os.path.join(HERE, 'rviz', 'glassvio.rviz')
 
 
 def generate_launch_description():
@@ -37,7 +39,12 @@ def generate_launch_description():
         DeclareLaunchArgument('bag', default_value=BAG),
         DeclareLaunchArgument('rate', default_value='1.0'),
         DeclareLaunchArgument(
-            'bootstrap_frames', default_value='30',
+            'rviz', default_value='false',
+            description='Open RViz with rviz/glassvio.rviz (odom trajectory, TF, feature '
+                        'overlay). Off by default: it competes for CPU with a worker that '
+                        'already drops frames during bootstrap attempts.'),
+        DeclareLaunchArgument(
+            'bootstrap_frames', default_value='120',
             description='Frames collected before attempting the bootstrap. Must span real '
                         'translation: a rotating MAV gives stage [2] no baseline, and the '
                         'window slides on until it finds one.'),
@@ -61,5 +68,16 @@ def generate_launch_description():
         ExecuteProcess(
             cmd=['ros2', 'bag', 'play', bag, '--rate', rate],
             output='screen',
+        ),
+        # RViz is OPTIONAL and off by default: it is a second process competing for the CPU,
+        # and the worker already falls behind on a bootstrap attempt (which drops frames --
+        # see the queue's splice). Turn it on when you want to look, not when you want numbers.
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            arguments=['-d', RVIZ],
+            output='log',
+            condition=IfCondition(LaunchConfiguration('rviz')),
         ),
     ])
