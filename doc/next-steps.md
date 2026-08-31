@@ -21,6 +21,27 @@ Measured on the deterministic harness (`estimator_check`, see below):
 The thesis — camera reprojection + IMU in ONE `NormalEquationsN<15>`, the same Gauss-Newton
 the LiDAR path uses — is demonstrated end to end.
 
+## Housekeeping: `glass_core` is now a proper git submodule
+
+Two things were wrong and are now fixed:
+
+1. `CMakeLists.txt` pointed `add_subdirectory` at `../glasslio/glass_core`, a sibling-checkout
+   path that never matched the actual directory name (`glass-lio`) — any real build should have
+   hit the `FATAL_ERROR` at configure time.
+2. This repo also carried its own committed copy of `glass_core/` that no CMake target ever
+   referenced — dead weight, stale relative to glass-lio's.
+
+Both are resolved by extracting `glass_core` into its own repo,
+[glass-core](https://github.com/Tim-HW/glass-core), and vendoring it here as a **git
+submodule** at `glass_core/`. glassvio no longer needs glass-lio checked out beside it at all —
+clone, then `git submodule update --init --recursive`. `CMakeLists.txt` now points
+`GLASS_CORE_DIR` at the local `glass_core/` submodule instead of reaching into a sibling repo.
+
+This matters for the plan below: glass-lio's `glass_core` (the same content, now the submodule's
+source of truth) had moved ahead of what this repo was built against, so pieces the table below
+used to list as speculative are
+now sitting right there once you build against the fixed path.
+
 ## THE key tool: `estimator_check`
 
 `src/checks/estimator_check.cpp` drives the REAL `VioEstimator` deterministically (no ROS, no
@@ -64,6 +85,33 @@ thread in this project lands here.
 these fixable bugs for worse ones, scale drift per segment and rotation degeneracy, and
 abandons the tight-coupling thesis the repo exists to show.)
 
+## Read this before Stage A: glass-lio built the exact same argument, and it was wrong
+
+glass-lio's tight-coupling work ([`doc/7-tight-coupling.md`](../glass-lio/doc/7-tight-coupling.md)
+§7.8b→§7.8c, in the sibling repo) made *precisely* this argument on the LiDAR side — "`x_i` is
+held infinitely certain, the fix is a real sliding window" — and built the primitives for it:
+gravity promoted to an estimated state, the `x_i`-uncertainty inflation, and a general
+Schur-complement `marginalization.hpp`. **It still diverged catastrophically (pose to 1.5M m).**
+
+The actual bug was two boring calibration numbers: a gravity prior anchored to its own running
+estimate (a random walk with no restoring force — small per-scan errors got shovelled into
+gravity and compounded), and a mistuned `lidar_sigma`. Fixing those two — zero new architecture
+— brought it to parity with the trusted loose path. The lesson they drew, twice (they got it
+wrong once even after being warned): **instrument the state, not the pose/error metric**, before
+trusting a "this needs a bigger architecture" diagnosis.
+
+Why this is worth pausing on here: glass-vio's own gravity is a **fixed constant**
+(`gravity_world_` in `vio_estimator.hpp`), never re-estimated after bootstrap, and the diagnosed
+scale bug ("EuRoC's accel bias is huge relative to the motion, biases the scale") has the same
+shape as glass-lio's gravity/accel-bias conflation bug. Before committing to Stage A's multi-day
+build, it's worth cheaply checking: add gravity-error and per-axis `b_a` columns to
+`estimator_check`'s CSV (not just `bay`/`gbay` magnitude) and see whether the ~20% scale error
+and the fast-motion divergence correlate with a specific miscalibrated scalar rather than
+genuinely needing multi-frame joint observability. If they do, that's a day of calibration, not
+a windowed solver. If they don't — if the bias truly never converges under any single-frame
+weighting, as the four-setting sweep already suggests — Stage A is the right call and now has
+more of its primitives built than the table below used to say.
+
 ## The plan: stage it, smallest useful build first
 
 ### Stage A — 3-keyframe fixed-lag smoother (do this first)
@@ -79,8 +127,13 @@ What it needs, and what already exists:
 | IMU factor between two keyframes: `∂r/∂x_j` AND `∂r/∂x_i` | **built + finite-diff-pinned** (`imuJacobian`, `imuJacobianI` in glass_core, `test_nav_residual`) |
 | State prior / `boxminus` for the window's oldest state | **built + pinned** (`priorResidual`, `priorJacobian`, `boxminus`) |
 | Reprojection factor (2x15 per landmark) | **built + pinned to 3e-10** (`reprojection.hpp`, `test_reprojection`) |
+| Schur-complement marginalization (Stage B's primitive, exact) | **built + pinned to 2.1e-17** (`marginalization.hpp`, `test_marginalization`) — pulled forward from Stage B since it now exists in glass_core anyway |
+| State-transition Jacobian `F` (for `P_j = F P_i F^T + G Q G^T`) | **built + pinned** (`imuStateTransition`) — the noise half was always `ImuPreintegration::covariance()` |
 | Dynamic-size normal equations (15*K wide) | **NEW** — `NormalEquationsN<N>` is fixed-size; needs a windowed/dynamic solver |
 | Keyframe selection + management | **NEW** — parallax/time-based keyframe insertion |
+
+The first four rows are only true as of the `glass_core` link fix above — they live in
+glass-lio's copy, which this repo wasn't actually building against until now.
 
 Success test: re-run `estimator_check`, watch `bay` climb to ~0.548 and `pos_err` flatten. If
 it does, the window works and the residual scale bias should shrink too (bias and scale are
