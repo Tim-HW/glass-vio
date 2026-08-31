@@ -15,12 +15,19 @@ reprojection residual**. One solver, two sensors, zero copied Jacobians.
 
 Like glass-lio, this repo is written to be **read**.
 
+- **[doc/solver.md](doc/solver.md)** — the tightly-coupled solve: the **three residuals**
+  (reprojection, IMU, prior) stacked into one 15-DoF Gauss-Newton system, how the Jacobians are
+  computed and why they are sparse by physics, and why *stacking into one `H` IS the fusion* —
+  no filter, no blend. The whole "one solver, two sensors" thesis, worked through.
 - **[doc/preintegration.md](doc/preintegration.md)** — how the IMU factor's engine room
   actually works: what one `integrate()` call does, the **ordering discipline** that
   separates a correct estimator from a plausible-looking wrong one, why the noise density
   is *divided* by `Δt`, and what the KITTI dead-reckon check does and does not prove.
   Complements glass-lio's [§7.4](../glasslio/doc/7-tight-coupling.md), which covers *why*
   preintegration exists; this covers *how*.
+- **[doc/next-steps.md](doc/next-steps.md)** — the cold-start handoff: current state, the
+  `estimator_check` measurement harness, the two remaining residuals with their measured causes,
+  and the staged plan for the sliding-window BA.
 
 ## Status
 

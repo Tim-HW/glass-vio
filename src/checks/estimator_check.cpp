@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -65,6 +66,7 @@ int main(int argc, char ** argv)
 {
   const std::string bag_path = (argc > 1) ? argv[1] : kDefaultBag;
   const std::string calib_dir = (argc > 2) ? argv[2] : "config";
+  const std::string csv_path = (argc > 3) ? argv[3] : "/tmp/glassvio_run.csv";
 
   glassvio::CameraCalib calib;
   glassvio::EurocDataset bag;
@@ -90,12 +92,31 @@ int main(int argc, char ** argv)
   std::size_t imu_cursor = 0;
   double t_prev = imu.empty() ? 0.0 : imu.front().t - 1.0;
 
+  // Per-frame CSV, so a run can be plotted rather than squinted at. One row per frame.
+  std::ofstream csv(csv_path);
+  csv <<
+    "t,stage,feats,map,pending,rmse_px,"
+    "pos_err,vel_err,"
+    "px,py,pz,gx,gy,gz,vx,vy,vz,gvx,gvy,gvz,"
+    "bgx,bgy,bgz,gbgx,gbgy,gbgz,bax,bay,baz,gbax,gbay,gbaz\n";
+  csv.setf(std::ios::fixed);
+  csv.precision(6);
+
   int bootstrapped_at = -1;
   int tracked = 0;
   int lost_at = -1;
   double boot_depth_median = 0.0;
   std::size_t boot_landmarks = 0;
   std::vector<double> errors;
+
+  // ALIGNMENT AT BOOTSTRAP, so the error is honest. The estimator DEFINES its own world:
+  // origin at the first body pose, +Z along gravity, yaw arbitrary. That frame is NOT the
+  // ground-truth frame, so a raw |p_est - p_gt| conflates real drift with a fixed origin/yaw
+  // offset -- which is exactly what inflated the earlier "3.4 m". T_align is the one rigid
+  // transform between the two worlds, fixed at the bootstrap instant; everything after is the
+  // drift THROUGH it.
+  Eigen::Isometry3d T_align = Eigen::Isometry3d::Identity();
+  const double t0 = bag.frames.front().t;
 
   for (std::size_t k = 0; k < bag.frames.size(); ++k) {
     const auto & f = bag.frames[k];
@@ -118,15 +139,17 @@ int main(int argc, char ** argv)
 
     const glassvio::FrameResult r = est.process(g);
 
+    // The estimator body pose in ITS world, this frame.
+    Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
+    T_wb.linear() = est.state().R.matrix();
+    T_wb.translation() = est.state().p;
+
     if (r.stage == glassvio::FrameResult::Stage::Bootstrapped) {
       bootstrapped_at = static_cast<int>(k);
       boot_landmarks = est.landmarks().size();
+      // The one rigid transform between est-world and gt-world, fixed here forever.
+      T_align = bag.gt.at(f.t) * T_wb.inverse();
 
-      // Landmark depths in the camera at the bootstrap pose: the direct scale readout. A
-      // metre-scale room should give metre-scale depths; ~3 cm is the node's bug.
-      Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
-      T_wb.linear() = est.state().R.matrix();
-      T_wb.translation() = est.state().p;
       const Eigen::Isometry3d T_cw = (T_wb * calib.T_cam_imu.inverse()).inverse();
       std::vector<double> depths;
       for (const auto & lm : est.landmarks()) {
@@ -137,29 +160,53 @@ int main(int argc, char ** argv)
 
       std::printf(
         "\nBOOTSTRAP at frame %d (%.1f s): %zu landmarks, median depth %.3f m, "
-        "|p|=%.2f, |v|=%.2f\n"
-        "  bg = [%+.4f %+.4f %+.4f]  (truth [%+.4f %+.4f %+.4f])\n",
-        bootstrapped_at, f.t - bag.frames.front().t, boot_landmarks, boot_depth_median,
-        est.state().p.norm(), est.state().v.norm(),
+        "|v|=%.2f\n  bg = [%+.4f %+.4f %+.4f]  (truth [%+.4f %+.4f %+.4f])\n",
+        bootstrapped_at, f.t - t0, boot_landmarks, boot_depth_median, est.state().v.norm(),
         est.state().bg.x(), est.state().bg.y(), est.state().bg.z(),
         bag.gt.gyroBias(f.t).x(), bag.gt.gyroBias(f.t).y(), bag.gt.gyroBias(f.t).z());
-
-    } else if (r.stage == glassvio::FrameResult::Stage::Tracking && r.pose_trusted) {
-      ++tracked;
-      // Position error against ground truth, in the world frame the estimator anchored to
-      // ground truth at the bootstrap frame -- so a straight difference is meaningful only
-      // after removing that anchor. Here we report the DRIFT since bootstrap instead: distance
-      // travelled by the estimate vs by ground truth over the same interval.
-      errors.push_back((r.pose.translation() - est.state().p).norm() * 0.0 +
-        (r.pose.translation() - bag.gt.at(f.t).translation()).norm());
     } else if (r.stage == glassvio::FrameResult::Stage::Lost) {
       if (lost_at < 0 && bootstrapped_at >= 0) {
         lost_at = static_cast<int>(k);
       }
     }
+
+    // --- CSV row, and the tracked-error accumulation, both off the ALIGNED pose.
+    if (bootstrapped_at >= 0 &&
+      (r.stage == glassvio::FrameResult::Stage::Tracking ||
+      r.stage == glassvio::FrameResult::Stage::Bootstrapped))
+    {
+      const Eigen::Isometry3d est_in_gt = T_align * T_wb;
+      const Eigen::Vector3d p = est_in_gt.translation();
+      const Eigen::Vector3d gp = bag.gt.at(f.t).translation();
+      const Eigen::Vector3d v = T_align.linear() * est.state().v;
+      const Eigen::Vector3d gv = bag.gt.velocity(f.t);
+      const double pos_err = (p - gp).norm();
+      const double vel_err = (v - gv).norm();
+      if (r.stage == glassvio::FrameResult::Stage::Tracking) {
+        ++tracked;
+        errors.push_back(pos_err);
+      }
+
+      const auto & s = est.state();
+      const Eigen::Vector3d gbg = bag.gt.gyroBias(f.t);
+      const Eigen::Vector3d gba = bag.gt.accelBias(f.t);
+      csv << (f.t - t0) << ","
+          << (r.stage == glassvio::FrameResult::Stage::Bootstrapped ? "boot" : "track") << ","
+          << r.features << "," << est.map().size() << "," << est.map().pending() << ","
+          << r.rmse_px << "," << pos_err << "," << vel_err << ","
+          << p.x() << "," << p.y() << "," << p.z() << ","
+          << gp.x() << "," << gp.y() << "," << gp.z() << ","
+          << v.x() << "," << v.y() << "," << v.z() << ","
+          << gv.x() << "," << gv.y() << "," << gv.z() << ","
+          << s.bg.x() << "," << s.bg.y() << "," << s.bg.z() << ","
+          << gbg.x() << "," << gbg.y() << "," << gbg.z() << ","
+          << s.ba.x() << "," << s.ba.y() << "," << s.ba.z() << ","
+          << gba.x() << "," << gba.y() << "," << gba.z() << "\n";
+    }
   }
 
-  std::printf("\n=== VERDICT ===\n");
+  csv.close();
+  std::printf("\nper-frame CSV -> %s\n\n=== VERDICT ===\n", csv_path.c_str());
   if (bootstrapped_at < 0) {
     std::printf("never bootstrapped -- stage [2]/[3]/[4] never cleared offline either\n");
     return 1;

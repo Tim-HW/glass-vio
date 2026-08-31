@@ -15,14 +15,10 @@ VioEstimator::VioEstimator(const CameraCalib & calib, const EstimatorParams & pa
   init_ = std::make_unique<VioInitializer>(calib_, p_.init);
   map_ = std::make_unique<LandmarkMap>(calib_, p_.map);
 
-  // The bias random-walk prior: how fast a bias may DRIFT between frames, from the datasheet
-  // rather than a guess. Note it says nothing about how WRONG a bias might be to begin with --
-  // that is P_'s job, and conflating the two is what glasslio's tight path warns about.
-  bias_information_.setIdentity();
-  bias_information_.topLeftCorner<3, 3>() /=
-    (calib_.gyro_random_walk * calib_.gyro_random_walk);
-  bias_information_.bottomRightCorner<3, 3>() /=
-    (calib_.accel_random_walk * calib_.accel_random_walk);
+  // The bias prior is built PER FRAME from the carried covariance + random-walk process noise
+  // (see process()), not once here -- glasslio's exact point: a fixed random-walk information
+  // models how fast a bias DRIFTS but never how WRONG it starts, and the wrong-start half is
+  // what lets b_a reach its true value.
 }
 
 void VioEstimator::reset()
@@ -268,19 +264,39 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
 
   // --- Track.
   ImuPreintegration pre(x_.bg, x_.ba, calib_.gyro_noise, calib_.accel_noise);
-  if (!imu_.preintegrate(
-      t_prev_, t, x_.bg, x_.ba, pre, calib_.gyro_noise, calib_.accel_noise))
-  {
-    lost_ = true;   // a hole in the stream: the factor has no delta to offer
-    out.stage = FrameResult::Stage::Lost;
-    return out;
-  }
+  const bool preint_ok = imu_.preintegrate(
+    t_prev_, t, x_.bg, x_.ba, pre, calib_.gyro_noise, calib_.accel_noise);
 
   std::unordered_map<long, cv::Point2f> obs;
   for (std::size_t i = 0; i < group.features.ids.size(); ++i) {
     if (map_->landmarks().count(group.features.ids[i])) {
       obs.emplace(group.features.ids[i], group.features.points[i]);
     }
+  }
+  if (!preint_ok) {
+    // A HOLE IN THE IMU STREAM -- and during warmup this is NOT a loss. A slow bootstrap makes
+    // the worker fall behind; a burst of dropped frames then leaves [t_prev, t] with a gap the
+    // splice could not fully bridge, and preintegration refuses it. Intermittent and pure
+    // timing (the same run tracks 26 s when the worker keeps up). Rather than die, re-establish
+    // the time base and coast on constant velocity for one frame: the map stays, ids stay, and
+    // the next interval is short again. Only OUTSIDE warmup is a broken IMU chain a real loss.
+    if (warmup_ > 0) {
+      --warmup_;
+      x_.p += x_.v * (t - t_prev_);   // no IMU delta to offer; hold velocity
+      t_prev_ = t;
+      Eigen::Isometry3d T_wc = Eigen::Isometry3d::Identity();
+      T_wc.linear() = x_.R.matrix();
+      T_wc.translation() = x_.p;
+      map_->insert(group.features, T_wc * calib_.T_cam_imu.inverse());
+      out.stage = FrameResult::Stage::Tracking;
+      out.pose_trusted = true;
+      out.pose = T_wc;
+      out.velocity = x_.v;
+      return out;
+    }
+    lost_ = true;
+    out.stage = FrameResult::Stage::Lost;
+    return out;
   }
 
   // The seed for Gauss-Newton. predictState is the right seed in steady state -- it uses the
@@ -296,11 +312,31 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
     guess.p = pnp.p;
   }
 
+  // THE BIAS PRIOR FROM THE CARRIED COVARIANCE, not a fixed random walk. This is the fix for
+  // the accel bias never moving: EuRoC's b_a is 0.55 m/s^2, we seed it at 0, and a fixed
+  // random-walk prior (information ~1e5) pinned it there -- the CSV showed b_a,y flat at ~0
+  // while the truth was 0.548, drift growing straight out of it.
+  //
+  // The Kalman-correct prior is (P_bias_prev + Q)^-1: loose while the bias is unknown (P_
+  // starts inflated -- OpenVINS's init_dyn_inflation_ba: 100, exactly this), tightening as
+  // res.H learns it. Q is the random walk as PROCESS noise (rw^2 * dt), so the bias can still
+  // drift in steady state. That is the whole of the standard IMU-bias treatment, and the fixed
+  // information matrix was the wrong half of it -- it modelled drift-rate but not
+  // initial-ignorance.
+  Eigen::Matrix<double, 6, 6> P_bias = Eigen::Matrix<double, 6, 6>::Zero();
+  P_bias.topLeftCorner<3, 3>() = P_.block<3, 3>(kIdxBg, kIdxBg);
+  P_bias.bottomRightCorner<3, 3>() = P_.block<3, 3>(kIdxBa, kIdxBa);
+  P_bias.topLeftCorner<3, 3>().diagonal().array() +=
+    calib_.gyro_random_walk * calib_.gyro_random_walk * pre.dt();
+  P_bias.bottomRightCorner<3, 3>().diagonal().array() +=
+    calib_.accel_random_walk * calib_.accel_random_walk * pre.dt();
+  const Eigen::Matrix<double, 6, 6> bias_prior_info = P_bias.inverse();
+
   // SOLVE FIRST, MAP SECOND. Landmarks are FIXED during the solve -- that is what keeps the
   // state at 15 DoF and lets NormalEquationsN<15> be reused, exactly as glasslio holds its
   // map's planes fixed while ICP runs.
   const VisualResult res = solveFrame(
-    map_->landmarks(), obs, x_, P_, pre, gravity_world_, guess, bias_information_, calib_,
+    map_->landmarks(), obs, x_, P_, pre, gravity_world_, guess, bias_prior_info, calib_,
     p_.visual);
   if (!res.valid) {
     // WARMUP GRACE, and it is not papering over a failure -- it fixes the last online/offline

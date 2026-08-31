@@ -66,10 +66,15 @@ struct EstimatorParams
   double sigma_position_m = 0.05;
   double sigma_velocity_mps = 0.10;
   double sigma_gyro_bias = 2.0e-3;
-  /// The loosest, because NOTHING estimates it. Stage [3] recovers only the gyro bias, and
-  /// EuRoC's accel bias is ~0.55 m/s^2 on one axis. The covariance admits that ignorance
-  /// rather than hiding it.
-  double sigma_accel_bias = 0.10;
+  /// MODERATE, and the story here is a real measured limit. EuRoC's b_a is 0.55 m/s^2 and we
+  /// seed it at 0, so the instinct is a loose prior to let the solve reach it (OpenVINS's
+  /// init_dyn_inflation_ba: 100). Measured across 0.1 / 0.4 / 1.0, b_a NEVER converges to
+  /// 0.55 -- it is only weakly observable per frame (dv/db_a ~ dt ~ 0.05), so a loose prior
+  /// only lets it WANDER and absorb the bootstrap's velocity/scale error, which made drift
+  /// WORSE (0.27 m at 0.1 -> 1.98 m at 1.0). A single-frame solve cannot pin a weakly-observable
+  /// bias; that is the sliding window's job. So this stays moderate: loose enough to adapt if
+  /// excitation is genuinely strong, tight enough not to soak up error to avoid declaring LOST.
+  double sigma_accel_bias = 0.2;
 };
 
 struct FrameResult
@@ -155,7 +160,6 @@ private:
   NavState x_;
   Eigen::Matrix<double, kNavDim, kNavDim> P_ =
     Eigen::Matrix<double, kNavDim, kNavDim>::Zero();
-  Eigen::Matrix<double, 6, 6> bias_information_ = Eigen::Matrix<double, 6, 6>::Identity();
   Eigen::Vector3d gravity_world_{0.0, 0.0, -kGravity};
   std::unique_ptr<LandmarkMap> map_;
   double t_prev_ = 0.0;

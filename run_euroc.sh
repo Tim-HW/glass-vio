@@ -23,6 +23,15 @@ else
   exit 1
 fi
 
+# STRIP THE SNAP GTK ENVIRONMENT. If this is launched from a snap-packaged editor's terminal
+# (VS Code snap sets SNAP_NAME=code, GTK_PATH=/snap/code/..., etc.), those vars leak into every
+# GUI child. RViz is a GTK app: GTK_PATH makes it load the snap's libcanberra-gtk-module, whose
+# RPATH drags in /snap/core20's libpthread, which is glibc-incompatible with the system one --
+# and rviz2 dies with `symbol lookup error ... GLIBC_PRIVATE`, exit 127. Unsetting these lets
+# RViz fall back to the system GTK. Harmless to the node and bag player, which use no GTK.
+unset GTK_PATH GTK_IM_MODULE_FILE GTK_MODULES GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR \
+      GIO_MODULE_DIR GTK_EXE_PREFIX LOCPATH
+
 # Default rviz:=true unless the caller already passed an rviz argument -- so `rviz:=false`
 # still turns it off, and we never set it twice (ros2 launch rejects duplicate args).
 RVIZ_ARG="rviz:=true"

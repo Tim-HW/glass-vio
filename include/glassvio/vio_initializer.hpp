@@ -56,8 +56,10 @@ struct InitializerParams
   /// fraction (sigma_s / |s|). This is what turns the standing KITTI lesson -- scale needs
   /// excitation -- into a real gate, and it is what lets the estimator retry past a
   /// poorly-excited window instead of bootstrapping at a metrically-wrong scale. Measured on
-  /// EuRoC V1_01: good windows ~0.02-0.10, degenerate ones 0.2-0.56.
-  double max_scale_uncertainty = 0.15;
+  /// EuRoC V1_01: 0.02 gave 2%-accurate scale, 0.10 gave 32% off, 0.2+ degenerate. 0.15 let a
+  /// 3x-biased-scale window through (est velocity 30% of truth, drift); 0.06 admits only
+  /// genuinely well-excited windows.
+  double max_scale_uncertainty = 0.06;
 };
 
 /// What the bootstrap produced. Everything spatial is in the SFM FRAME -- the base camera --
