@@ -10,7 +10,7 @@ sliding window — is the answer to the same question: **which state makes all m
 consistent?** This module is that question's machinery, in the abstract. Modules 3–5 supply the
 actual residuals; here we build the engine that consumes them.
 
-Code: [`gauss_newton.hpp`](../../glasslio/glass_core/include/glass_core/gauss_newton.hpp)
+Code: [`gauss_newton.hpp`](../glass_core/include/glass_core/gauss_newton.hpp)
 (`NormalEquationsN<N>`: the accumulator + solve). Full derivation: glass-lio's
 [gauss-newton.md](../../glasslio/doc/gauss-newton.md).
 

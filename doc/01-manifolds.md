@@ -9,8 +9,8 @@ ordinary $\mathbb{R}^3$: you add them, subtract them, differentiate them, done. 
 — the orientation $\mathbf{R}$ — do **not**, and every hard line in this codebase traces to that one
 block. This module builds exactly the rotation machinery the rest of the course uses, and no more.
 
-Code: [`sophus/so3.hpp`](../../glasslio/glass_core/include/sophus) (the group),
-[`nav_state.hpp`](../../glasslio/glass_core/include/glass_core/nav_state.hpp) (`boxplus`/`boxminus`
+Code: [`sophus/so3.hpp`](../glass_core/include/sophus) (the group),
+[`nav_state.hpp`](../glass_core/include/glass_core/nav_state.hpp) (`boxplus`/`boxminus`
 on the full 15-DoF state). The deeper treatment is glass-lio's
 [gauss-newton.md §6](../../glasslio/doc/gauss-newton.md).
 
@@ -113,7 +113,7 @@ $$
 (\mathbf{R}\,\mathrm{Exp}(\delta\boldsymbol{\phi}),\ \mathbf{p}+\delta\mathbf{p},\ \mathbf{v}+\delta\mathbf{v},\ \mathbf{b}_g+\delta\mathbf{b}_g,\ \mathbf{b}_a+\delta\mathbf{b}_a).
 $$
 
-That is [`nav_state.hpp`](../../glasslio/glass_core/include/glass_core/nav_state.hpp) in one line:
+That is [`nav_state.hpp`](../glass_core/include/glass_core/nav_state.hpp) in one line:
 a 15-DoF manifold with exactly **one** non-trivial block. Everything the solver does is: linearize
 in the flat tangent space, solve for $\delta\mathbf{x}$, retract with `⊞`.
 
@@ -169,7 +169,7 @@ colcon test --packages-select glasslio --ctest-args -R nav_residual ; colcon tes
 
 1. **Confirm it passes.** The analytic and numeric Jacobians agree — the `⊞`/`Exp`/`J_r` machinery
    above is self-consistent.
-2. **Now break it.** In [`nav_residual.hpp`](../../glasslio/glass_core/include/glass_core/nav_residual.hpp),
+2. **Now break it.** In [`nav_residual.hpp`](../glass_core/include/glass_core/nav_residual.hpp),
    replace the right Jacobian `Jr` with the identity `I` in the rotation block, rebuild, re-run. The
    test fails — but only in the entries where the rotation is large. That failure *is* §5's trap: at
    small angles the bug is invisible. Revert.

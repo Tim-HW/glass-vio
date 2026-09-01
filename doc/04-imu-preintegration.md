@@ -10,9 +10,9 @@ subtlety — and the reason this is a whole module — is that naively integrati
 the previous state's rotation, which the solver keeps changing. **Preintegration** removes that
 coupling. This module builds the delta, the residual it feeds, and its Jacobian.
 
-Code: [`preintegration.cpp`](../../glasslio/glass_core/src/preintegration.cpp),
-[`nav_residual.hpp`](../../glasslio/glass_core/include/glass_core/nav_residual.hpp) (the residual +
-Jacobians). Checks: [`test_preintegration.cpp`](../../glasslio/glass_core/test/test_preintegration.cpp),
+Code: [`preintegration.cpp`](../glass_core/src/preintegration.cpp),
+[`nav_residual.hpp`](../glass_core/include/glass_core/nav_residual.hpp) (the residual +
+Jacobians). Checks: [`test_preintegration.cpp`](../glass_core/test/test_preintegration.cpp),
 [`imu_dead_reckon_check.cpp`](../src/checks/imu_dead_reckon_check.cpp) (real data).
 
 ---

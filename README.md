@@ -47,24 +47,20 @@ Next phases (the actual VIO):
 
 ## How it shares the engine
 
-`glass_core` is **not** a colcon package — it is a pure-CMake sub-project that physically
-lives in the glass-lio repo at `glasslio/glass_core`. glassvio is a **sibling checkout** and
-pulls it in with `add_subdirectory`:
+`glass_core` is **not** a colcon package — it is a pure-CMake sub-project with its own repo,
+[glass-core](https://github.com/Tim-HW/glass-core), vendored here as a **git submodule** at
+`glass_core/` and pulled in with `add_subdirectory`. glass-lio's copy is the same submodule —
+one engine, one history, two front-ends, no copy-paste of Jacobians.
 
+```bash
+# after cloning glassvio, fetch the submodule too:
+git submodule update --init --recursive
 ```
-src/
-├── glasslio/            (glass-lio repo)
-│   └── glass_core/      the shared engine
-└── glassvio/            (this repo)  → add_subdirectory(../glasslio/glass_core)
-```
-
-So **glass-lio must be checked out beside glassvio** — CMake errors out clearly if the
-`../glasslio/glass_core` path is missing.
 
 ## Build & run
 
 ```bash
-# from a colcon workspace with both repos under src/
+# from a colcon workspace, glassvio under src/ (glass_core comes along as its submodule)
 colcon build --packages-select glassvio
 source install/setup.bash
 ros2 run glassvio glassvio_node --ros-args -p imu_topic:=/livox/imu
@@ -74,4 +70,4 @@ ros2 run glassvio glassvio_node --ros-args -p imu_topic:=/livox/imu
 ## License
 
 **[MIT](LICENSE)** — code, config, docs. The shared `glass_core` engine and its vendored
-Sophus headers keep their own (also MIT) terms; see the glass-lio repo.
+Sophus headers keep their own (also MIT) terms; see the [glass-core](https://github.com/Tim-HW/glass-core) repo.

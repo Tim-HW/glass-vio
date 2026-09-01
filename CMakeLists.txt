@@ -24,16 +24,14 @@ find_package(Eigen3 REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 
 # The shared estimation engine. It is NOT a colcon package -- it is a pure-CMake
-# subproject that physically lives in the glass-lio repo (glasslio/glass_core). glassvio
-# is a sibling checkout, so we reach into that tree and add_subdirectory it, exactly as
-# glasslio itself does. This is the whole point of glass_core: two front-ends, one engine,
-# no copy-paste of Jacobians.
-set(GLASS_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../glasslio/glass_core")
+# subproject, extracted to its own repo (github.com/Tim-HW/glass-core) and vendored here
+# as a git submodule, so glassvio needs no sibling checkout of glass-lio. This is the whole
+# point of glass_core: two front-ends, one engine, no copy-paste of Jacobians.
+set(GLASS_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/glass_core")
 if(NOT EXISTS "${GLASS_CORE_DIR}/CMakeLists.txt")
   message(FATAL_ERROR
     "glass_core not found at ${GLASS_CORE_DIR}.\n"
-    "glassvio shares the glass-lio repo's engine -- check out glass-lio beside glassvio "
-    "so the path src/glasslio/glass_core exists.")
+    "It's a git submodule -- run `git submodule update --init --recursive`.")
 endif()
 add_subdirectory("${GLASS_CORE_DIR}" glass_core)
 
