@@ -35,12 +35,31 @@ static const char * kDefaultGt = "data/vicon_room1/V1_01_easy/gt/data.csv";
 namespace
 {
 
-constexpr double kMaxMedianSampson = 1.0;   ///< px; the gate
-constexpr int kStride = 40;                 ///< only check every Nth frame pair
+constexpr double kMaxMedianSampson = 3.0;   ///< px; the gate. A correct calibration on real KLT
+                                            ///< tracks + VICON ground truth over a ~0.25 m
+                                            ///< baseline lands ~1.7 px (tracking noise + gt
+                                            ///< interpolation), so a WRONG extrinsic (tens of px,
+                                            ///< see the small-baseline rows) is cleanly caught.
+constexpr int kStride = 40;                 ///< sample every Nth frame (which pairs to test)
+/// Minimum baseline for a pair to be SCORED. Below this the camera has barely translated, the
+/// epipole sits in-frame, and Sampson goes numerically wild (both tiny and huge) regardless of
+/// calibration -- no leverage, so don't let those rows pollute the median.
+constexpr double kMinBaseline = 0.10;       ///< metres
+/// Frames BETWEEN the two views of each tested pair. NOT 1: adjacent EuRoC frames are 0.05 s
+/// apart (~1 cm baseline), and F = K^-T [t]x R K^-1 -> 0 as |t| -> 0, so BOTH the Sampson
+/// numerator and denominator collapse and the metric goes to ~0 no matter whether the
+/// calibration is right -- the test passes by measuring nothing. 10 frames gives a
+/// ~0.2-0.3 m baseline, where a wrong extrinsic actually blows the Sampson error up.
+constexpr int kGap = 10;
 
 /// Sampson distance: the first-order approximation to the geometric distance from a
 /// correspondence to its epipolar line, in pixels. Preferred over the raw algebraic error
 /// x2' F x1, which is not a distance and scales with the coordinates.
+///
+/// Returns a NEGATIVE sentinel when the point is degenerate (at/near the epipole, where the
+/// epipolar line is undefined and `den` -> 0). Such a point carries no epipolar constraint, so
+/// the caller SKIPS it rather than scoring it 0 -- a fake-perfect 0 is exactly what let the
+/// old zero-baseline test pass.
 double sampson(
   const Eigen::Matrix3d & F, const Eigen::Vector2d & x1, const Eigen::Vector2d & x2)
 {
@@ -49,16 +68,7 @@ double sampson(
   const Eigen::Vector3d Fp1 = F * p1;
   const Eigen::Vector3d Ftp2 = F.transpose() * p2;
   const double den = Fp1.head<2>().squaredNorm() + Ftp2.head<2>().squaredNorm();
-  return den > 0.0 ? std::abs(p2.dot(Fp1)) / std::sqrt(den) : 0.0;
-}
-
-Eigen::Matrix3d hat(const Eigen::Vector3d & v)
-{
-  Eigen::Matrix3d m;
-  m << 0.0, -v.z(), v.y(),
-    v.z(), 0.0, -v.x(),
-    -v.y(), v.x(), 0.0;
-  return m;
+  return den > 1e-12 ? std::abs(p2.dot(Fp1)) / std::sqrt(den) : -1.0;
 }
 
 }  // namespace
@@ -93,7 +103,7 @@ int main(int argc, char ** argv)
   std::printf("\n frame   tracks   baseline   median Sampson\n");
 
   for (std::size_t i = kStride; i < bag.frames.size(); i += kStride) {
-    const auto & prev = bag.frames[i - 1];
+    const auto & prev = bag.frames[i - kGap];
     const auto & cur = bag.frames[i];
 
     // Relative camera pose from ground truth: X_j = T_cj_ci * X_i.
@@ -101,9 +111,13 @@ int main(int argc, char ** argv)
       calib.T_cam_imu * bag.gt.at(cur.t).inverse() * bag.gt.at(prev.t) *
       calib.T_cam_imu.inverse();
 
+    if (T_cj_ci.translation().norm() < kMinBaseline) {
+      continue;   // no leverage: the epipole is in-frame and Sampson is meaningless
+    }
+
     // E = [t]x R, then F = K^-T E K^-1 pulls it back into pixels.
     const Eigen::Matrix3d F =
-      Kinv.transpose() * (hat(T_cj_ci.translation()) * T_cj_ci.linear()) * Kinv;
+      Kinv.transpose() * (Sophus::SO3d::hat(T_cj_ci.translation()) * T_cj_ci.linear()) * Kinv;
 
     std::vector<double> d;
     for (const auto & [id, p2] : cur.by_id) {
@@ -111,8 +125,11 @@ int main(int argc, char ** argv)
       if (it == prev.by_id.end()) {
         continue;   // track was born this frame: no correspondence to test
       }
-      d.push_back(
-        sampson(F, Eigen::Vector2d(it->second.x, it->second.y), Eigen::Vector2d(p2.x, p2.y)));
+      const double s =
+        sampson(F, Eigen::Vector2d(it->second.x, it->second.y), Eigen::Vector2d(p2.x, p2.y));
+      if (s >= 0.0) {
+        d.push_back(s);   // negative = degenerate (at the epipole); no constraint, skip it
+      }
     }
     if (d.size() < 50) {
       continue;

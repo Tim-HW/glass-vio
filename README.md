@@ -11,23 +11,23 @@ reprojection residual**. One solver, two sensors, zero copied Jacobians.
 > subtly-wrong Jacobian can sink a LiDAR odometry and a visual one, it should live in one
 > place, tested once — not copy-pasted and left to drift.
 
-## Docs
+## Docs — a course in visual-inertial SLAM
 
-Like glass-lio, this repo is written to be **read**.
+This repo is written to be **read**, and its docs are structured as a **bottom-up course**: build a
+monocular VIO from the estimation problem up, one runnable module at a time, with an oracle-scored
+lab behind every claim.
 
-- **[doc/solver.md](doc/solver.md)** — the tightly-coupled solve: the **three residuals**
-  (reprojection, IMU, prior) stacked into one 15-DoF Gauss-Newton system, how the Jacobians are
-  computed and why they are sparse by physics, and why *stacking into one `H` IS the fusion* —
-  no filter, no blend. The whole "one solver, two sensors" thesis, worked through.
-- **[doc/preintegration.md](doc/preintegration.md)** — how the IMU factor's engine room
-  actually works: what one `integrate()` call does, the **ordering discipline** that
-  separates a correct estimator from a plausible-looking wrong one, why the noise density
-  is *divided* by `Δt`, and what the KITTI dead-reckon check does and does not prove.
-  Complements glass-lio's [§7.4](../glasslio/doc/7-tight-coupling.md), which covers *why*
-  preintegration exists; this covers *how*.
-- **[doc/next-steps.md](doc/next-steps.md)** — the cold-start handoff: current state, the
-  `estimator_check` measurement harness, the two remaining residuals with their measured causes,
-  and the staged plan for the sliding-window BA.
+- **[doc/README.md](doc/README.md)** — **start here.** The syllabus: nine modules from the manifold
+  ([1](doc/01-manifolds.md)) through Gauss-Newton ([2](doc/02-least-squares.md)), the camera
+  ([3](doc/03-camera.md)) and IMU ([4](doc/04-imu-preintegration.md)), the tight-coupling thesis
+  ([5](doc/05-tight-coupling.md)), monocular bootstrap ([6](doc/06-epipolar-and-sfm.md)–[7](doc/07-metric-initialization.md)),
+  and where it still drifts ([8](doc/08-sliding-window.md)) — each with a **Lab** you run and then
+  break on purpose.
+- **[doc/pipeline.md](doc/pipeline.md)** — the same system in *execution* order: the diagram, the
+  frames, the threading, the live status. The reference map, for once you know the parts.
+- glass-lio's **[gauss-newton.md](../glasslio/doc/gauss-newton.md)** and
+  **[testing.md](../glasslio/doc/testing.md)** — the shared engine's own derivation and testing
+  philosophy; `glass_core` is shared verbatim.
 
 ## Status
 
