@@ -45,11 +45,13 @@ where it still drifts.
 
 - **Read in order.** Each module assumes the one before it. Modules 1–2 are the math spine;
   skimming them makes 3–7 opaque.
-- **Do every Lab.** They are not exercises bolted on — they are the argument. Build from a colcon
-  workspace with glassvio and glasslio side by side under `src/`, then run the named binary:
+- **Do every Lab.** They are not exercises bolted on — they are the argument. The engine
+  (`glass_core`) comes in as a git submodule, so this repo is the only checkout you need:
   ```bash
+  git submodule update --init --recursive   # once, after cloning
+  ./scripts/download_bag.sh                 # once: the EuRoC sequence every Lab is scored on
   colcon build --packages-select glassvio
-  ./build/glassvio/<lab_binary>        # e.g. ./build/glassvio/epipolar_check
+  ./build/glassvio/<lab_binary>             # e.g. ./build/glassvio/epipolar_check
   ```
 - **Break things on purpose.** Most Labs end with a *"now break it"* step — flip a sign, drop a
   Jacobian term, loosen a gate — and watch the estimator stay confident while going wrong. That is
@@ -65,9 +67,10 @@ enough C++ to read the code. No prior SLAM. The Lie-group machinery is built fro
 
 - **[pipeline.md](pipeline.md)** — the same system in *execution* order: the diagram, the frames,
   the threading, the live status. The map of the running program; read it once you know the parts.
-- glass-lio's **[gauss-newton.md](../../glasslio/doc/gauss-newton.md)** and
-  **[testing.md](../../glasslio/doc/testing.md)** — the shared engine's own derivation of the
-  manifold solver and its testing philosophy. `glass_core` is shared verbatim, so both apply here.
+- glass-lio's **[gauss-newton.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/gauss-newton.md)**
+  and **[testing.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/testing.md)** — the shared
+  engine's own derivation of the manifold solver and its testing philosophy. `glass_core` is shared
+  verbatim, so both apply here.
 
 ## The one-paragraph version of what you will build
 

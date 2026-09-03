@@ -26,7 +26,7 @@ residual** where the LiDAR point-to-plane was. One solver, two sensors, zero cop
 **The foundations under all of it** (not runtime stages): [Module 1 — manifolds](01-manifolds.md),
 [Module 2 — Gauss-Newton](02-least-squares.md), [Module 4 — preintegration](04-imu-preintegration.md),
 and [Module 8 — the sliding-window backend](08-sliding-window.md) that the drift needs. glass-lio's
-[gauss-newton.md](../../glasslio/doc/gauss-newton.md) and [testing.md](../../glasslio/doc/testing.md)
+[gauss-newton.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/gauss-newton.md) and [testing.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/testing.md)
 apply unchanged — `glass_core` is shared.
 
 ## The one-paragraph version
@@ -126,7 +126,9 @@ Parsed by the node from ROS params; defaults in [`vio_estimator.hpp`](../include
 ## Running
 
 ```bash
-# from a colcon workspace with glassvio and glasslio checked out side by side under src/
+# from a colcon workspace with glassvio under src/ (glass_core arrives as its submodule)
+git submodule update --init --recursive
+./scripts/download_bag.sh      # once: EuRoC V1_01_easy, converted to ROS 2
 colcon build --packages-select glassvio
 ./run_euroc.sh                 # V1_01_easy at 1x, with RViz
 ./run_euroc.sh rviz:=false     # headless, for clean numbers

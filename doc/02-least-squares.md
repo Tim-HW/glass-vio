@@ -12,7 +12,7 @@ actual residuals; here we build the engine that consumes them.
 
 Code: [`gauss_newton.hpp`](../glass_core/include/glass_core/gauss_newton.hpp)
 (`NormalEquationsN<N>`: the accumulator + solve). Full derivation: glass-lio's
-[gauss-newton.md](../../glasslio/doc/gauss-newton.md).
+[gauss-newton.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/gauss-newton.md).
 
 ---
 

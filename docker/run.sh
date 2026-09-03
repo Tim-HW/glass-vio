@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Build and enter the glasslio dev container, without VS Code.
+# Build and enter the glassvio dev container, without VS Code.
 #
 #   ./docker/run.sh              build if needed, then drop into a shell
 #   ./docker/run.sh --rebuild    force a rebuild of the image
 #   ./docker/run.sh <cmd...>     run one command in the container and exit
 #
 # Examples:
-#   ./docker/run.sh colcon build --packages-select glasslio
-#   ./docker/run.sh colcon test  --packages-select glasslio
-#   ./docker/run.sh ./src/glasslio/scripts/run_bag.sh -n
+#   ./docker/run.sh colcon build --packages-select glassvio
+#   ./docker/run.sh colcon test  --packages-select glassvio
+#   ./docker/run.sh ./src/glassvio/scripts/download_bag.sh
 #
-# The repo is mounted at /ws/src/glasslio, i.e. as the src/ of a colcon workspace at
+# The repo is mounted at /ws/src/glassvio, i.e. as the src/ of a colcon workspace at
 # /ws -- so builds behave exactly as they do on a normal machine. Build artefacts land
 # in /ws/build and /ws/install INSIDE the container, so they never collide with a host
 # build of the same tree.
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-readonly IMAGE="glasslio-dev"
+readonly IMAGE="glassvio-dev"
 readonly REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log() { printf '\033[1;34m[docker]\033[0m %s\n' "$*"; }
@@ -78,7 +78,7 @@ exec docker run --rm -it \
   --ipc=host \
   --env ROS_DOMAIN_ID=42 \
   "${GUI_ARGS[@]}" \
-  --volume "${REPO_DIR}:/ws/src/glasslio:rw" \
+  --volume "${REPO_DIR}:/ws/src/glassvio:rw" \
   --workdir /ws \
   "$IMAGE" \
   "${@:-bash}"

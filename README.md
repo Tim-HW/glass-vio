@@ -25,9 +25,9 @@ lab behind every claim.
   break on purpose.
 - **[doc/pipeline.md](doc/pipeline.md)** — the same system in *execution* order: the diagram, the
   frames, the threading, the live status. The reference map, for once you know the parts.
-- glass-lio's **[gauss-newton.md](../glasslio/doc/gauss-newton.md)** and
-  **[testing.md](../glasslio/doc/testing.md)** — the shared engine's own derivation and testing
-  philosophy; `glass_core` is shared verbatim.
+- glass-lio's **[gauss-newton.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/gauss-newton.md)**
+  and **[testing.md](https://github.com/Tim-HW/glass-lio/blob/main/doc/testing.md)** — the shared
+  engine's own derivation and testing philosophy; `glass_core` is shared verbatim.
 
 ## Status
 
@@ -60,11 +60,15 @@ git submodule update --init --recursive
 ## Build & run
 
 ```bash
-# from a colcon workspace, glassvio under src/ (glass_core comes along as its submodule)
+# from a colcon workspace with glassvio under src/
+git submodule update --init --recursive   # once: pulls glass_core
+./scripts/download_bag.sh                 # once: EuRoC V1_01_easy, converted to ROS 2
 colcon build --packages-select glassvio
 source install/setup.bash
-ros2 run glassvio glassvio_node --ros-args -p imu_topic:=/livox/imu
-# then play a bag with an IMU stream; the node logs when init completes
+
+./run_euroc.sh                            # the node, live, with RViz
+./build/glassvio/estimator_check          # the deterministic harness, straight to a CSV
+colcon test --packages-select glassvio    # the Jacobian suites
 ```
 
 ## License

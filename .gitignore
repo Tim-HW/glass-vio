@@ -9,3 +9,6 @@ compile_commands.json
 # python bytecode (launch files)
 __pycache__/
 *.pyc
+
+# datasets -- gigabytes, fetched by scripts/download_bag.sh, never committed
+data/

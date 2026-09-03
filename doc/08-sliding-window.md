@@ -79,7 +79,54 @@ Only the **shape** grows:
 
 ---
 
-## 5. The plan — stage it, smallest useful build first
+## 5. Before you build it — glass-lio made this exact argument, and was wrong
+
+§3 is a good argument. It is also, nearly word for word, the argument glass-lio made about *its*
+tight-coupling divergence — and glass-lio has since documented, at length, that the argument was not
+what was actually wrong.
+
+The LiDAR side reasoned: $\mathbf{x}_i$ is held infinitely certain, a single solve can never correct
+it, so the fix is a real sliding window. It then *built the primitives* — gravity promoted to a
+state, the closed-form $\mathbf{x}_i$ marginalization, the Schur kernel, the state-transition
+Jacobian — pinned each against finite differences, and re-ran. **It still diverged: 1.5 million
+metres** ([`7-tight-coupling.md` §7.8b](https://github.com/Tim-HW/glass-lio/blob/main/doc/7-tight-coupling.md)).
+
+The real cause, found in §7.8c by logging the *state* instead of the pose: the gravity prior anchored
+$\mathbf{g}$ to its own carried estimate every scan — a random walk with no restoring force. Gravity
+is near-unobservable over one 0.1 s scan, so the solver explained every small error by tilting
+$\mathbf{g}$, the anchor chased it, and it compounded. One line. With that fixed and `lidar_sigma`
+calibrated to the sensor's actual ~2 cm, tight coupling went from *broken* to **parity with the
+trusted loose path** — two numbers, zero new architecture.
+
+`★ Insight — the sophisticated wrong story ───────`
+The §7.8b diagnosis was not lazy. It was careful, primitive-by-primitive, and it named a **real**
+deficiency: $\mathbf{x}_i$ *is* held certain, and that *is* wrong. It simply was not what dominated
+the error. **A defect being real does not make it the one you are measuring.** The pose said only
+"everything is huge"; the state said "gravity, specifically."
+`──────────────────────────────────────────────────`
+
+**What that means here.** glassvio's gravity is a fixed constant — `gravity_world_` in
+[`vio_estimator.hpp`](../include/glassvio/vio_estimator.hpp), set at bootstrap and never
+re-estimated — so it cannot run away the way glass-lio's did. But the failure *mode* generalizes:
+§2 attributes the scale bias to an un-estimated $\mathbf{b}_a$, and that attribution has not been
+measured against the alternative — that some *fixed* quantity (the bootstrap gravity, the extrinsic,
+the scale gate's threshold) is simply mis-set. A window cannot fix a wrong constant.
+
+So before Stage A, spend the day [the Lab](#lab--the-measurement-discipline-itself) asks for:
+
+1. Add gravity-error and **per-axis** $\mathbf{b}_a$ columns to `estimator_check`'s CSV — it logs
+   `bay`/`gbay` only.
+2. Check whether the ~20% scale error and the t≈42 s divergence track a *fixed* miscalibration, or a
+   genuinely unconverged state.
+
+If $\mathbf{b}_a$ never converges under any single-frame weighting — which §3's four-setting sweep
+already suggests — Stage A is right and you have lost a day. If it does converge once something else
+is corrected, you have saved the weeks Stage A costs. glass-lio paid the second price; this module
+exists so this project does not pay it twice.
+
+---
+
+## 6. The plan — stage it, smallest useful build first
 
 ### Stage A — 3-keyframe fixed-lag smoother (do this first)
 
@@ -92,8 +139,13 @@ bias observable.
 | IMU factor between two keyframes: `∂r/∂x_j` AND `∂r/∂x_i` | **built + pinned** (`imuJacobian`, `imuJacobianI`, `test_nav_residual`) |
 | State prior / `boxminus` for the window's oldest state | **built + pinned** (`priorResidual`, `priorJacobian`, `boxminus`) |
 | Reprojection factor (2×15 per landmark) | **built + pinned to 3e-10** (`reprojection.hpp`) |
+| Schur-complement marginalization (Stage B's primitive) | **built + pinned to 2.1e-17** (`marginalization.hpp`, `test_marginalization`) |
+| State-transition Jacobian $\mathbf{F}$, for $\mathbf{P}_j=\mathbf{F}\mathbf{P}_i\mathbf{F}^\top+\mathbf{G}\mathbf{Q}\mathbf{G}^\top$ | **built + pinned** (`imuStateTransition`; the noise half is `ImuPreintegration::covariance()`) |
 | Dynamic-size normal equations ($15K$ wide) | **NEW** — `NormalEquationsN<N>` is fixed-size; needs a windowed solver |
 | Keyframe selection + management | **NEW** — parallax/time-based insertion |
+
+Only the last two rows are actually missing. The rest arrived with `glass_core` — glass-lio built
+them chasing §5's divergence, and they are shared here verbatim.
 
 **Success test:** re-run `estimator_check`, watch `bay` (accel-bias-y estimate) climb toward 0.548 and
 `pos_err` flatten. If it does, the window works — and the residual scale bias should shrink too, since
@@ -105,7 +157,13 @@ Schur-complement the oldest keyframe + its landmarks into a **prior** on the rem
 of dropping it. This is the hard, essential part of a real VIO backend (where VINS-Mono spends most of
 its backend complexity), and consistency matters: a wrong marginalization injects spurious
 information. Landmarks are marginalized out each step, leaving a dense system over just the $K$
-keyframe states ($15K$, small). Do **not** start here.
+keyframe states ($15K$, small).
+
+The *kernel* is already built and exact — `schurMarginalize` in
+[`marginalization.hpp`](../glass_core/include/glass_core/marginalization.hpp), pinned to 2.1e-17
+against both the full solve (must match) and the naive hold-fixed solve (must differ). What Stage B
+adds is the bookkeeping around it: deciding what to marginalize, keeping the resulting prior
+consistent as the window slides, and not double-counting information. Do **not** start here.
 
 ### Stage C — feature supply for fast motion (independent, smaller)
 
@@ -118,7 +176,7 @@ and testable in `estimator_check` needs a little plumbing. Separable from the wi
 
 ---
 
-## 6. Landmines (each cost real time on this project)
+## 7. Landmines (each cost real time on this project)
 
 - **Online ≠ offline, over and over.** Every node-only bug was "the end of the buffer is not NOW":
   bias pairs (2912 frames vs 50), dropped IMU chains, stale SfM windows, churned KLT ids.
@@ -155,7 +213,11 @@ defines its own gravity-aligned world.
    argument, on your screen. This is the number Stage A must move.
 2. **Plot `vel_err`.** The ~20% under-estimate of §2.1, steady — a *metric* error, not a tracking one
    (`rmse` stays 2–4 px throughout).
-3. **The habit to keep:** measure here *before* every change and re-measure *after*. Every self-deception
+3. **Add the columns §5 asks for, and try to falsify §3.** Log the gravity error and each axis of
+   $\mathbf{b}_a$ separately, then ask whether the drift tracks a *fixed* miscalibration rather than an
+   unconverged state. This is the step that would have saved glass-lio a rewrite, and it costs a day
+   against Stage A's weeks. Do it before you build the window, not after.
+4. **The habit to keep:** measure here *before* every change and re-measure *after*. Every self-deception
    this project caught — a bias-prior loosening that made drift worse, a condition-number gate that did
    not discriminate, a feature-supply hypothesis that was wrong — was caught by this CSV, not by
    reasoning. That habit is the last thing the course has to teach.
@@ -168,7 +230,7 @@ defines its own gravity-aligned world.
 ./build/glassvio/estimator_check     # deterministic drive + CSV — measure here first
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
-colcon test --packages-select glassvio glasslio   # unit tests (Jacobians + reprojection + tracker)
+colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker
 ```
 
 ---

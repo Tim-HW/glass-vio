@@ -12,7 +12,7 @@ block. This module builds exactly the rotation machinery the rest of the course 
 Code: [`sophus/so3.hpp`](../glass_core/include/sophus) (the group),
 [`nav_state.hpp`](../glass_core/include/glass_core/nav_state.hpp) (`boxplus`/`boxminus`
 on the full 15-DoF state). The deeper treatment is glass-lio's
-[gauss-newton.md §6](../../glasslio/doc/gauss-newton.md).
+[gauss-newton.md §6](https://github.com/Tim-HW/glass-lio/blob/main/doc/gauss-newton.md).
 
 ---
 
@@ -162,9 +162,9 @@ derivative's definition.
 way.
 
 ```bash
-colcon build --packages-select glasslio
-./build/glasslio/test_nav_residual         # (ctest target; run via colcon test if not a bare binary)
-colcon test --packages-select glasslio --ctest-args -R nav_residual ; colcon test-result --verbose
+colcon build --packages-select glassvio
+./build/glassvio/test_nav_residual         # glass_core is a subproject, so its suites build here
+colcon test --packages-select glassvio --ctest-args -R nav_residual ; colcon test-result --verbose
 ```
 
 1. **Confirm it passes.** The analytic and numeric Jacobians agree — the `⊞`/`Exp`/`J_r` machinery
