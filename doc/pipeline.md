@@ -94,18 +94,24 @@ V1_01:
 | [1] Feature tracking | ✅ FAST + KLT, persistent ids, radtan undistortion at the boundary. |
 | [2] Sync | ✅ Working; IMU spliced across dropped frames. |
 | [3] Bootstrap | ✅ Metric scale via the observability gate — 1.62 m landmark depth, gyro bias to ~2%. |
-| [4] Track | ✅ Tight solve + sliding-window map. Tracks ~29 s, median drift 0.65 m. |
+| [4] Track | ✅ Tight solve + sliding-window map, plus Stage A's keyframe-window bundle adjustment and an inlier gate on every tracker solve. Tracks all 132 s of the ground truth at metric scale (speed ratio 1.02), median drift 0.54 m; the error first passes 1 m at 130 s, though the fast section near 88 s is still fragile. |
 
-The offline thesis check `vio_check` is **0.036 m**. 71 unit tests, zero failures. **Two residuals
-remain**, both the sliding window's job ([Module 8](08-sliding-window.md)): a ~20% residual scale bias
-and a fast-motion divergence, both rooted in the accelerometer bias being too weakly observable to
-converge in a single-frame solve.
+The offline thesis check `vio_check` is **0.036 m**; the unit suites are green. **Two residuals
+remain** ([Module 8](08-sliding-window.md)): a ~20% scale shrink and a fast-motion divergence. Traced
+by substituting ground truth one quantity at a time, both come from the loop in which solved poses
+triangulate the map that sets the next poses — with landmarks triangulated from ground-truth poses
+instead, the same estimator tracks the whole 130 s sequence at 0.023 m.
 
 ## Not implemented (yet)
 
-- **Sliding-window bundle adjustment** — the real fix for the drift and the accel bias. Staged plan in
-  [Module 8](08-sliding-window.md); the Lie-algebra blocks (`imuJacobianI`, the state prior) are
-  already built and pinned.
+- **Marginalization (Stage B)** — the window drops its oldest keyframe outright; a Schur prior would
+  keep what it knew. The kernel (`schurMarginalize`) is built and pinned. Stage A itself — the
+  keyframe-window bundle adjustment — is built: [Module 8 §6](08-sliding-window.md).
+- **Gravity re-levelling** — `gravity_world_` stays frozen at the bootstrap's estimate (a 4° tilt).
+  Re-estimating it inside the window was built and halves the tilt, but gains no position accuracy,
+  so it is off; ORB-SLAM3's answer, a global inertial optimization that re-levels the whole map, is
+  not built. [Module 8 §6](08-sliding-window.md). (Triangulating from the window: built, measured
+  worse, off.)
 - **Loop closure / relocalisation** — none. This is odometry, not SLAM.
 - **Stereo / multi-camera** — the bag has cam1, but only cam0 is used.
 

@@ -115,10 +115,11 @@ observability — measured, a good window and a bad one both gave ~60.
 
 On EuRoC V1_01, $\sigma_s/|s|$ of 0.02 gave a 2%-accurate scale, 0.10 gave 32% off, 0.2+ degenerate.
 The gate at **0.06** makes the estimator wait for a genuinely well-excited window (1.62 m landmark
-depth, velocity to ~80% of truth); 0.15 let a 3×-biased window through. It checks **conditioning, not
-accuracy** — a well-conditioned window can still be biased (that residual 20% is
-[Module 8](08-sliding-window.md)'s problem) — so re-derive the threshold from the
-uncertainty-vs-accuracy curve on a new sequence.
+depth, 0.86 of the true speed at bootstrap); 0.15 let a 3×-biased window through. It checks
+**conditioning, not accuracy** — a well-conditioned window can still be biased — so re-derive the
+threshold from the uncertainty-vs-accuracy curve on a new sequence. (The ~20% scale error seen *while
+tracking* is not this window's doing: it is made afterwards, by the map, as
+[Module 8 §4](08-sliding-window.md) measures.)
 
 ---
 

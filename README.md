@@ -31,19 +31,22 @@ lab behind every claim.
 
 ## Status
 
-**Early skeleton.** What runs today:
+**A working monocular VIO**, measured on EuRoC V1_01 by the deterministic harness
+(`estimator_check`, which also gates CI with explicit thresholds):
 
-- **IMU initialization** on the shared engine — gyro bias, gravity, gravity-aligned world
-  frame — the same bootstrap GlassLIO uses (`glass_core::ImuInit`). Verified against the
-  GlassLIO test bag: `|g|` = 9.781, mount tilt 7.33°, matching GlassLIO exactly.
+- **Front end** — FAST + KLT tracking with persistent ids, points undistorted at the boundary.
+- **Bootstrap** — up-to-scale SfM, the gyro bias from vision's rotations, and a linear
+  visual-inertial alignment gated on scale observability: a metric start, no static window.
+- **Tracking** — a camera reprojection residual and the IMU preintegration factor in one 15-DoF
+  Gauss-Newton solve against a sliding landmark map.
+- **Keyframe window** — the last 10 keyframes re-solved jointly with their landmarks, in the shape
+  of ORB-SLAM3's local inertial BA. This is what holds the metric scale (speed ratio 1.02; 0.78
+  without it).
 
-Next phases (the actual VIO):
-
-1. **Feature front-end** — FAST/Shi-Tomasi detection + KLT optical-flow tracking.
-2. **Reprojection factor** — pixel error of a projected 3D landmark, analytic Jacobian
-   pinned against finite differences, folded into the same `glass_core` Gauss-Newton solver.
-3. **Landmarks + sliding window** — triangulation and a small joint solve over visual +
-   IMU factors.
+It tracks all 132 s of V1_01's ground truth at 0.54 m median error, and the error first passes 1 m
+at 130 s — though the fast section near 88 s is still fragile. Odometry only — no
+loop closure. What is still open (the accel bias, gravity's tilt, the fast-motion sections) and how
+each was measured is in [doc/08-sliding-window.md](doc/08-sliding-window.md).
 
 ## How it shares the engine
 

@@ -1,178 +1,357 @@
 # Module 8 — Sliding window & drift
 
-> **Prerequisite:** [Modules 5, 7](05-tight-coupling.md). **After this you can:** diagnose why a
-> single-frame solve leaves a residual scale bias, explain why a window of keyframes fixes it, and
-> stage the sliding-window bundle adjustment that is the real backend.
+> **Prerequisite:** [Modules 5, 7](05-tight-coupling.md). **After this you can:** localize an
+> estimator's drift to one loop by substituting ground truth for one quantity at a time, explain why
+> that loop needs landmarks *in the state* rather than a wider window of poses, and stage the bundle
+> adjustment that is the real backend.
 
 The system so far works: it bootstraps at metric scale and tracks. It also *drifts*, in a specific,
-measurable way — and the fix is the one piece not yet built. This capstone is both the honest state
-of the estimator and the design of what completes it. It doubles as the **cold-start handoff**: read
-it first if you are picking glassvio back up.
+measurable way. This capstone is the honest state of the estimator, the story of how that drift was
+traced — including the plausible explanation that turned out to be wrong — and the design of what
+completes it. It doubles as the **cold-start handoff**: read it first if you are picking glassvio
+back up.
 
-Code target: a windowed solver over [`vio_estimator.cpp`](../src/vio/vio_estimator.cpp).
-Measurement tool: [`estimator_check.cpp`](../src/checks/estimator_check.cpp).
+Code target: [`vio_estimator.cpp`](../src/vio/vio_estimator.cpp),
+[`landmark_map.cpp`](../src/vio/landmark_map.cpp). Measurement tool:
+[`estimator_check.cpp`](../src/checks/estimator_check.cpp).
 
 ---
 
 ## 1. Where we are — measured
 
 A working monocular VIO on the ROS node: bootstraps at true metric scale, tracks ~20–30 s on EuRoC
-V1_01, maintains a sliding-window landmark map live, publishes odom + TF. 71 unit tests green; the
-offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
+V1_01, maintains a sliding-window landmark map live, publishes odom + TF. The unit suites are green;
+the offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
 
-| metric | value |
-|---|---|
-| bootstrap landmark depth | 1.62 m (true room scale) |
-| velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.80 |
-| tracked before losing the scene | ~29 s |
-| median position drift (aligned to GT at bootstrap) | 0.65 m |
+| metric | per-frame tracker alone | **today's default** (§6) |
+|---|---|---|
+| bootstrap landmark depth | 1.62 m (true room scale) | 1.62 m |
+| velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.78 | **~1.02** |
+| tracked | ~29 s | **132 s** — to the end of the ground truth |
+| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.54 m** (over 132 s) |
+| error first passed 1 m | — | **130.5 s** (fragile near 88 s: §6) |
+
+§2–§5 are the story of the left column — how its drift was traced. §6 is the right column.
 
 The thesis — camera reprojection + IMU in ONE `NormalEquationsN<15>` — is demonstrated end to end.
 
 ---
 
-## 2. The two remaining residuals, and their measured cause
+## 2. The drift — and the story we told about it
 
-Both trace to the same root, and both are the sliding window's job.
+Two residuals remain:
 
-1. **~20% residual scale under-estimate** ($\lVert\mathbf{v}\rVert_{\text{est}}\approx0.80$). The
-   bootstrap scale is computed by [Module 7](07-metric-initialization.md) from *accelerometer motion /
-   vision motion* with $\mathbf{b}_a=0$. EuRoC's accel bias is 0.55 m/s² — huge relative to the motion
-   — so it biases the scale. Tightening the observability gate got us 3×-off → 20%-off by picking a
-   better-excited window; the residual *is* the un-estimated bias.
-2. **Divergence in the fast final section** ($\lVert\mathbf{v}\rVert$ runs to ~6 m/s at ~t=42 s). Two
-   things stack: the map thins faster than it re-triangulates under fast motion, and the
-   weakly-observable states (velocity, accel bias) drift once vision stops constraining them.
+1. **A ~20% scale shrink.** $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}\approx0.78$,
+   and the trajectory itself agrees: over each half-second, the estimate moves ~0.8× as far as the
+   truth. A *metric* error, not a tracking one — `rmse` stays 2–4 px throughout.
+2. **Divergence in the fast final section** ($\lVert\mathbf{v}\rVert$ runs away at ~t = 42 s).
 
----
+The first explanation — and for a while the documented one — was the **accelerometer bias**. The
+bootstrap ([Module 7](07-metric-initialization.md)) solves the scale with $\mathbf{b}_a = 0$, and
+EuRoC's is 0.55 m/s², large against the motion. Worse, $\mathbf{b}_a$ is only *weakly* observable per
+frame ($\partial\Delta\mathbf{v}/\partial\mathbf{b}_a\sim\Delta t\sim0.05$): measured across four prior
+settings (`sigma_accel_bias` 0.1 / 0.2 / 0.4 / 1.0), $b_{a,y}$ **never** converges to its true 0.548 — a
+loose prior lets it wander, a tight one pins it at zero. A window of $K$ keyframes would constrain the
+same $\mathbf{b}_a$ through $K-1$ IMU factors jointly. So: build a fixed-lag smoother.
 
-## 3. Why the fix is a window — the observability argument
-
-The accel bias is only **weakly** observable per frame: $\partial\Delta\mathbf{v}/\partial\mathbf{b}_a\sim\Delta t\sim0.05$.
-Measured across four prior settings (`sigma_accel_bias` 0.1 / 0.2 / 0.4 / 1.0), $b_{a,y}$ **never**
-converges to its true 0.548 — a loose prior only lets it *wander*, a tight one *pins it at zero*.
-
-`★ Insight — one frame cannot pin a weak state ─`
-A single-frame solve constrains $\mathbf{b}_a$ through *one* short interval — barely. A window of $K$
-keyframes constrains the *same* $\mathbf{b}_a$ through all $K-1$ IMU factors **jointly**, and now the
-tiny per-frame sensitivities add up to something the solve can actually resolve. That is the entire
-argument, and it is why every drift thread in this project lands here. This is also exactly
-[Module 2](02-least-squares.md)'s loop — just with a bigger $\mathbf{x}$.
-`─────────────────────────────────────────────────`
-
-(Loose coupling was considered and rejected: it trades these fixable bugs for worse ones — scale drift
-per segment, rotation degeneracy — and abandons the tight-coupling thesis the repo exists to show.)
+Every sentence of that is true. It was not what was wrong.
 
 ---
 
-## 4. It is the same Gauss-Newton, just wider
+## 3. Before you build it — glass-lio made this exact argument
 
-Nothing about [Module 2](02-least-squares.md) changes — same linearize → accumulate → solve → retract.
-Only the **shape** grows:
-
-- $\delta\mathbf{x}$ becomes $15K$ long ($K$ keyframes) instead of 15;
-- $\mathbf{H}$ becomes $15K\times15K$;
-- the IMU factor between two keyframes contributes to **two** state blocks —
-  $\partial\mathbf{r}/\partial\mathbf{x}_i$ (`imuJacobianI`, [Module 4](04-imu-preintegration.md)) *and*
-  $\partial\mathbf{r}/\partial\mathbf{x}_j$ — instead of one;
-- the same accel bias appears in $K-1$ IMU factors at once, which is what finally makes it observable.
-
----
-
-## 5. Before you build it — glass-lio made this exact argument, and was wrong
-
-§3 is a good argument. It is also, nearly word for word, the argument glass-lio made about *its*
-tight-coupling divergence — and glass-lio has since documented, at length, that the argument was not
-what was actually wrong.
-
-The LiDAR side reasoned: $\mathbf{x}_i$ is held infinitely certain, a single solve can never correct
-it, so the fix is a real sliding window. It then *built the primitives* — gravity promoted to a
-state, the closed-form $\mathbf{x}_i$ marginalization, the Schur kernel, the state-transition
-Jacobian — pinned each against finite differences, and re-ran. **It still diverged: 1.5 million
-metres** ([`7-tight-coupling.md` §7.8b](https://github.com/Tim-HW/glass-lio/blob/main/doc/7-tight-coupling.md)).
-
-The real cause, found in §7.8c by logging the *state* instead of the pose: the gravity prior anchored
-$\mathbf{g}$ to its own carried estimate every scan — a random walk with no restoring force. Gravity
-is near-unobservable over one 0.1 s scan, so the solver explained every small error by tilting
-$\mathbf{g}$, the anchor chased it, and it compounded. One line. With that fixed and `lidar_sigma`
-calibrated to the sensor's actual ~2 cm, tight coupling went from *broken* to **parity with the
-trusted loose path** — two numbers, zero new architecture.
+It is also, nearly word for word, the argument glass-lio made about *its* tight-coupling divergence.
+The LiDAR side reasoned that $\mathbf{x}_i$ is held infinitely certain, so a single solve can never
+correct it, so the fix is a real sliding window. It *built the primitives* — gravity as a state, the
+closed-form $\mathbf{x}_i$ marginalization, the Schur kernel, the state-transition Jacobian — pinned
+each against finite differences, and re-ran. **It still diverged: 1.5 million metres**
+([`testing.md` §12](https://github.com/Tim-HW/glass-lio/blob/main/doc/testing.md#12-case-study--making-tight-coupling-work-on-the-real-bag)).
+The real cause, found by logging the *state* instead of the pose, was a gravity prior anchored to its
+own estimate — a random walk with no restoring force. One line. Fixed, and with `lidar_sigma`
+calibrated to the sensor, tight coupling reached parity with the trusted loose path: two numbers, zero
+new architecture.
 
 `★ Insight — the sophisticated wrong story ───────`
-The §7.8b diagnosis was not lazy. It was careful, primitive-by-primitive, and it named a **real**
-deficiency: $\mathbf{x}_i$ *is* held certain, and that *is* wrong. It simply was not what dominated
-the error. **A defect being real does not make it the one you are measuring.** The pose said only
-"everything is huge"; the state said "gravity, specifically."
+The glass-lio diagnosis was careful, and it named a **real** deficiency. It simply was not what
+dominated the error. **A defect being real does not make it the one you are measuring.** So before
+building a window, glassvio ran the one-day experiment that would have saved glass-lio the rewrite.
 `──────────────────────────────────────────────────`
-
-**What that means here.** glassvio's gravity is a fixed constant — `gravity_world_` in
-[`vio_estimator.hpp`](../include/glassvio/vio_estimator.hpp), set at bootstrap and never
-re-estimated — so it cannot run away the way glass-lio's did. But the failure *mode* generalizes:
-§2 attributes the scale bias to an un-estimated $\mathbf{b}_a$, and that attribution has not been
-measured against the alternative — that some *fixed* quantity (the bootstrap gravity, the extrinsic,
-the scale gate's threshold) is simply mis-set. A window cannot fix a wrong constant.
-
-So before Stage A, spend the day [the Lab](#lab--the-measurement-discipline-itself) asks for:
-
-1. Add gravity-error and **per-axis** $\mathbf{b}_a$ columns to `estimator_check`'s CSV — it logs
-   `bay`/`gbay` only.
-2. Check whether the ~20% scale error and the t≈42 s divergence track a *fixed* miscalibration, or a
-   genuinely unconverged state.
-
-If $\mathbf{b}_a$ never converges under any single-frame weighting — which §3's four-setting sweep
-already suggests — Stage A is right and you have lost a day. If it does converge once something else
-is corrected, you have saved the weeks Stage A costs. glass-lio paid the second price; this module
-exists so this project does not pay it twice.
 
 ---
 
-## 6. The plan — stage it, smallest useful build first
+## 4. The falsification — ground truth, one quantity at a time
 
-### Stage A — 3-keyframe fixed-lag smoother (do this first)
+The deterministic harness can replace any single estimated quantity with ground truth. If the drift
+vanishes, that quantity carries it; if it stays, that quantity is a bystander. Each row is one flag
+and about a minute of CPU:
 
-A window of $K=3$–5 keyframe `NavState`s optimized jointly, oldest simply **dropped** when the window
-slides (no marginalization yet — accept the small information loss). The minimum that makes the accel
-bias observable.
+| `estimator_check` flag | replaced with ground truth | tracked | median pos err | position scale (15–35 s) |
+|---|---|---|---|---|
+| *(none)* | nothing | 29 s | 0.652 m | ≈ 0.79 |
+| `--oracle-ba` | $\mathbf{b}_a$ at bootstrap | 74 s | 0.777 m † | ≈ 0.76 |
+| `--parallax=3` | nothing — triangulation gate 1° → 3° | 38 s | 0.803 m | ≈ 0.75 |
+| `--oracle-map` | the poses new landmarks are triangulated from | **133 s — whole sequence** | **0.024 m** | **≈ 0.97** |
+| `--oracle-ba --oracle-map` | both | **130 s — whole sequence** | **0.023 m** | **≈ 0.98** |
 
-| piece | status |
-|---|---|
-| IMU factor between two keyframes: `∂r/∂x_j` AND `∂r/∂x_i` | **built + pinned** (`imuJacobian`, `imuJacobianI`, `test_nav_residual`) |
-| State prior / `boxminus` for the window's oldest state | **built + pinned** (`priorResidual`, `priorJacobian`, `boxminus`) |
-| Reprojection factor (2×15 per landmark) | **built + pinned to 3e-10** (`reprojection.hpp`) |
-| Schur-complement marginalization (Stage B's primitive) | **built + pinned to 2.1e-17** (`marginalization.hpp`, `test_marginalization`) |
-| State-transition Jacobian $\mathbf{F}$, for $\mathbf{P}_j=\mathbf{F}\mathbf{P}_i\mathbf{F}^\top+\mathbf{G}\mathbf{Q}\mathbf{G}^\top$ | **built + pinned** (`imuStateTransition`; the noise half is `ImuPreintegration::covariance()`) |
-| Dynamic-size normal equations ($15K$ wide) | **NEW** — `NormalEquationsN<N>` is fixed-size; needs a windowed solver |
-| Keyframe selection + management | **NEW** — parallax/time-based insertion |
+† Over a run 2.5× longer; on the span both tracked (15–42 s) it is 0.62 m against the baseline's 0.66 m.
+*Position scale* is the estimate's displacement over the truth's, summed over half-second steps.
 
-Only the last two rows are actually missing. The rest arrived with `glass_core` — glass-lio built
-them chasing §5's divergence, and they are shared here verbatim.
+What each row says:
 
-**Success test:** re-run `estimator_check`, watch `bay` (accel-bias-y estimate) climb toward 0.548 and
-`pos_err` flatten. If it does, the window works — and the residual scale bias should shrink too, since
-bias and scale are coupled through [Module 7 §3](07-metric-initialization.md)'s equation.
+- **$\mathbf{b}_a = 0$ at bootstrap is a real error, but a secondary one.** The alignment absorbs the
+  bias as a tilted gravity — 4.04° at bootstrap, against 0.41° with the true bias
+  ($\arctan(0.548/9.81) = 3.2°$) — and that tilt costs the fast section (29 s → 74 s). But it is **not**
+  the scale error: from the oracle's metric bootstrap (speed ratio 1.06), position scale is back to 0.8
+  within five seconds. And seeded at the true 0.548, tracking drags $b_{a,y}$ to −0.25. The bias is
+  *absorbing* an error, not causing one.
+- **Estimating $\mathbf{b}_a$ in the alignment cannot fix it either.** `estimate_accel_bias`
+  ([Module 7](07-metric-initialization.md)) adds $\mathbf{b}_a$ as three more linear unknowns, gated on
+  their marginal std. Over the 1 s SfM window that std is **4.6–6.8 m/s²** — without rotation,
+  $\mathbf{b}_a$ is indistinguishable from a tilt of $\mathbf{g}$ — so the gate refuses, correctly.
+- **Not a triangulation selection bias.** Each track is triangulated at the first frame its parallax
+  clears the gate, which favours noise that makes points look *closer*. A 3° gate, far above the noise,
+  changes nothing.
+- **It is the map.** Triangulate new landmarks from ground-truth poses and the *same* estimator — same
+  solve, same IMU factor, same biases, even the 4°-tilted $\mathbf{b}_a = 0$ bootstrap — holds metric
+  scale for the entire sequence at 2 cm.
+
+`★ Insight — oracle substitution ────────────────`
+This is the cheapest discriminator an estimator has, and the reason `estimator_check` exists. The
+fourth row cost a minute and is worth more than weeks of architecture: it says the solve, the IMU
+factor, and the bootstrap are all fine *given a correct map* — and so it says where **not** to build.
+`─────────────────────────────────────────────────`
+
+---
+
+## 5. The loop, and why a window of poses would not break it
+
+The drift lives in a loop that runs every frame:
+
+```
+solve the pose against FIXED landmarks  →  triangulate new landmarks FROM that pose  →  repeat
+```
+
+Any error in a solved pose is written into the landmarks it triangulates, and those landmarks then
+set the next pose as if they were ground truth. This is exactly the loop that makes monocular visual
+odometry drift in scale. The IMU is supposed to be the anchor — the one sensor with a metre — but in
+this design it only ever touches the *pose*: a pixel-precise map outvotes one 0.05 s IMU interval
+every frame, and the landmarks themselves never feel the accelerometer at all.
+
+So the first-planned Stage A — a window of keyframe *states* with the landmarks still held fixed —
+would leave the loop intact. The landmarks would still come from solved poses and still be frozen
+while the window solves. It would make $\mathbf{b}_a$ more observable, and $\mathbf{b}_a$ would
+converge to whatever value best explains a shrinking map.
+
+Breaking the loop means **landmarks join the state**: estimate $K$ keyframes and the landmarks they
+observe jointly, so the IMU factors between keyframes pull the *whole structure* — poses and points —
+to metric scale. That is bundle adjustment, and it is the same Gauss-Newton as
+[Module 2](02-least-squares.md), just wider:
+
+- $\delta\mathbf{x}$ becomes $15K + 3L$ ($K$ keyframes, $L$ landmarks);
+- each reprojection row gains a $2\times3$ block for its landmark,
+  $\partial\mathbf{r}/\partial\mathbf{P}_w = \mathbf{J}_\pi\mathbf{R}_{ci}\mathbf{R}^\top$ — the exact
+  negative of its position block ([Module 3 §4](03-camera.md)): a landmark moving is the camera moving
+  the other way;
+- the landmark part of $\mathbf{H}$ is block-diagonal ($3\times3$ per landmark), so the **Schur
+  complement** eliminates it cheaply, leaving a $15K$ system over the keyframes;
+- each IMU factor touches **two** keyframe blocks — `imuJacobianI` and `imuJacobian`
+  ([Module 4](04-imu-preintegration.md));
+- the same $\mathbf{b}_a$ appears in $K-1$ IMU factors — §2's observability argument, still true, now
+  with a map that is not shrinking underneath it.
+
+---
+
+## 6. The plan — smallest discriminating step first
+
+### Step 0 — can weighting make the IMU hold the metre? (done: no)
+
+glass-lio's lesson applies once more: before architecture, check the numbers. If the camera and IMU
+were merely mis-weighted, a knob would close the gap — so every knob was swept with
+`estimator_check`, against the `--oracle-map` row as target:
+
+| knob (solved-pose map) | speed ratio | outcome |
+|---|---|---|
+| IMU weight ≈ 0 — pure vision | 0.53–0.61 | the map loop **contracts by itself**: scale 0.86 → 0.55 in 20 s |
+| IMU weight 1 (default) | 0.78 | an equilibrium near 0.8 |
+| IMU weight 2 | 0.87 | lost after 19 s |
+| IMU weight 4–16 | — | diverges within 5–10 s — **even on a ground-truth map** |
+| pixel sigma 2 / 4 / 8 / 16 px | 0.84 / 0.81 / 0.74 / 0.68 | best at 2 px, far short of 1.0 |
+| IMU noise densities ×10 / ×40 | 0.61 / 0.53 | a weaker IMU — worse |
+
+Three conclusions:
+
+- **The contraction belongs to the vision loop, and the IMU is the only thing resisting it.** More
+  IMU weight restores scale monotonically.
+- **No weight reaches the target.** Past ×2 the estimator destabilizes, even on a ground-truth map
+  and even with ×10 noise. That is the knob, not the factor: the extra weight compounds through the
+  carried covariance ($\mathbf{P} = \mathbf{H}^{-1}$ feeds the next frame's $\Sigma_{\text{eff}}$), an
+  over-confidence spiral.
+- **So the fix is structural.** The IMU has to be able to move the landmarks, not only the pose —
+  Stage A.
+
+**A second mis-set constant, found on the way.** `gravity_world_` is frozen at the bootstrap's
+estimate. From the $\mathbf{b}_a = 0$ bootstrap that estimate is tilted 4.04° — a permanent world-frame
+error of $9.81\sin 4.04° = 0.69$ m/s² — and the tracker's $\mathbf{b}_a$, a *body*-frame state, chases
+it as the vehicle turns. Even on a ground-truth map it never converges: $\lvert\mathbf{b}_a - \text{truth}\rvert$
+oscillates at 0.6–0.8 m/s² for 130 s. From the true-$\mathbf{b}_a$ bootstrap (0.41° tilt) it holds
+within 0.03–0.22. This is exactly §3's warning — a window cannot fix a wrong constant — so gravity's
+direction (2 DoF) must become estimable after the bootstrap: a state in the Stage A window, or a
+re-run of the inertial alignment over a longer, rotating trajectory (ORB-SLAM3 refines its IMU
+initialization this way).
+
+**The target stays measured, not guessed:** with solved poses, the position scale and
+$\lVert\mathbf{v}\rVert$ ratio should approach 1.0, and `pos_err` should head toward the
+`--oracle-map` row's 0.02 m.
+
+### Stage A — windowed bundle adjustment: built, and it fixes the scale
+
+Code: [`keyframe_window.cpp`](../src/vio/keyframe_window.cpp), hooked into the tracker in
+[`vio_estimator.cpp`](../src/vio/vio_estimator.cpp). Before writing it, the two reference systems
+were read for their actual choices:
+
+| | VINS-Fusion | ORB-SLAM3 (`LocalInertialBA`) | glassvio |
+|---|---|---|---|
+| window | ~10 frames; keyframe on 10 px parallax | 10 keyframes, temporal chain | 10 keyframes, one every 4 frames (0.2 s) |
+| landmarks | inverse depth, anchored in a frame | XYZ, Schur-eliminated | XYZ, Schur-eliminated (`schurSolve`) |
+| oldest state | marginalized into a prior | the keyframe before it, fixed | the anchor, fixed (default) or gauge-only (`--anchor-gauge`) |
+| solver | Ceres dogleg, 8 iterations | g2o LM, 10 iterations | LM, 8 iterations |
+
+ORB-SLAM3 is the closer fit because its split *is* ours: per-frame tracking against fixed map points
+(our `solveFrame`), plus a local BA on keyframes that refines the points — which is exactly what
+breaks §5's loop. Every factor is glass_core's and was already pinned: the IMU residual with *both*
+halves of its Jacobian (`imuJacobianI` finally earns its keep), the bias random walk, the anchor
+prior, the reprojection factor. The two new pieces are pinned too — the landmark block of the
+reprojection Jacobian (`test_reprojection`, 1e-9) and the Schur solve, against a dense solve (1e-14)
+and glass_core's `schurMarginalize` (6e-16) in `test_keyframe_window`.
+
+Measured on V1_01:
+
+| `estimator_check` | tracked | median pos err | speed ratio |
+|---|---|---|---|
+| `--no-window` — byte-identical to the pre-Stage-A tracker | 29 s | 0.652 m | 0.775 |
+| **window, anchor fixed (default)** | **80 s** | **0.456 m** | **1.019** |
+| window, `--anchor-gauge` | 76 s | 0.677 m | 1.020 |
+| window + `--oracle-ba` | 91 s | 0.397 m | 1.002 |
+| window, IMU noise ×10 / ×50 | 51 / 31 s | 0.42 / 0.37 m | 0.95 / 0.92 |
+| `--oracle-map` — the target | 133 s | 0.024 m | 0.995 |
+
+**The scale is fixed**: position scale holds 0.97–1.07 through the run, because the IMU now moves
+the map. What the measurements leave open:
+
+- **The anchor.** Gauge-only is the one that can re-level against gravity, yet the fixed anchor wins
+  on both counts — so it is the default. Why the re-levelling does not pay is not yet understood.
+- **$\mathbf{b}_a$ still does not converge** — $\lvert\mathbf{b}_a-\text{truth}\rvert$ stays 0.4–0.6 m/s²
+  even from the true bias. Something the window cannot absorb is still mis-set.
+- **Inflating the IMU noise** toward VINS-Fusion's values makes everything worse: the datasheet
+  densities stay.
+- **The deaths are the tracker's, not the window's.** Before each loss the window moves the state
+  by only a few centimetres. In the fast sections (84–92 s, 103 s) the map thins below 20, and a
+  frame with a handful of features lets a degenerate PnP guess through the warmup coast; every
+  solved-pose run also meets one tracker frame near 89.6 s with over 1 600 px of reprojection
+  error. Pending tracks pile up there too (150–440), which first looked like the cause. It is not —
+  see below.
+- **Cost**: ~100 ms per keyframe solve, most of it accumulating the reduced system over landmark
+  pairs. Fine offline; the live node needs it trimmed (symmetry, fewer iterations) or threaded.
+
+**Triangulating from the window — built, measured, and off.** The pile-up suggested that pending
+tracks never mature because they are triangulated from the *tracker's* stored poses, which the
+window later corrects. So `KeyframeWindow::triangulate` does what VINS-Fusion and ORB-SLAM3 do: every
+track the newest keyframe sees, triangulated linearly over all its keyframe observations at the
+*optimized* poses, and kept only through the parallax, cheirality and 3 px reprojection gates
+(pinned in `test_keyframe_window`). Then the map was instrumented to say *why* each pending track
+fails to triangulate (the `tri_*` columns), and run against ground-truth poses:
+
+| 80–90 s, summed over frames | tried | matured | too little parallax | behind a camera / too far |
+|---|---|---|---|---|
+| Stage A (solved poses) | 11 546 | 2 329 | 5 701 | 3 516 |
+| `--oracle-map` (ground-truth poses) | 12 921 | 2 480 | 5 913 | 4 528 |
+
+The hypothesis was wrong. With *perfect* poses the map matures almost as many tracks and fails as
+many on parallax and depth: the pile-up is what fast, rotating motion looks like, not a symptom.
+**Supply was never short — the landmarks' quality is what differs.** And the change hurt by the
+honest score: with it on, the error first passed 1 m at 40 s instead of 89 s. So it is off by default
+(`--window-tri` to compare), kept and pinned for when the poses it trusts beat the map's.
+
+`★ Insight — survival time lies ─────────────────`
+That run was first reported as an *improvement* — "tracked 92.5 s against 80 s" — because the
+estimator only declares a loss when it runs out of features. It had diverged at ~92 s and flew on at
+ten times the true speed, 13 m off, until 105 s. The harness now prints the first time the error
+passed 1 m. A plausible number is still a number the estimator chose to report.
+`─────────────────────────────────────────────────`
+
+**Gravity's direction as a window state — built, measured, and off.** Step 0's second finding was
+a mis-set constant: `gravity_world_` frozen at the bootstrap's 4° tilt, a permanent 0.69 m/s² error.
+So the window gained two unknowns — gravity's tilt, $\mathbf{g}(\boldsymbol\theta) =
+\mathrm{Exp}([\theta_x,\theta_y,0])\,\mathbf{g}_\text{ref}$, its magnitude fixed — observable against
+the fixed anchor, and entering every IMU factor through glass_core's `imuGravityJacobian` times the
+$3\times2$ tilt map (pinned by finite differences in `test_keyframe_window`); the tracker adopts the
+refined gravity after each solve.
+
+| `estimator_check` | first >1 m | median err | gravity error while tracking | $\lvert\mathbf{b}_a-\text{truth}\rvert$ |
+|---|---|---|---|---|
+| gravity frozen (default) | **89.0 s** | 0.46 m | 4.04° | 0.58 → 0.43 m/s² |
+| `--gravity` (prior 1°, none, or 0.3° alike) | 87.9 s | 0.46 m | **1.8–2.7°** | 0.55 → 0.47 m/s² |
+
+It works as a gravity estimate — the tilt halves while tracking — and buys nothing where it
+counts: the same position error, the same first >1 m, and the accel bias still unconverged. (Its
+last-frame gravity error first read 15° — that was the divergence at 90 s, not the estimator;
+end-of-run numbers lie the way survival time does.) So it is off by default.
+
+ORB-SLAM3 does this differently in kind, not degree: at 2, 5 and 15 s it runs a **global** inertial
+optimization over *all* keyframes — gravity `Rwg`, scale and both biases jointly, where the
+trajectory's rotation finally separates $\mathbf{b}_a$ from tilt — and then `ApplyScaledRotation`
+re-levels the *whole map*, followed by scale-and-gravity refinements every 10 s until 75 s. A window
+tilting gravity inside itself is not that.
+
+**Refusing the tracker's blow-ups — built, measured, on.** The 1 600 px frame at 89.6 s turned out
+to be downstream. Frame by frame, the break starts at 87.60 s with one *accepted* solve that is
+almost pure garbage — 1 inlier of 94 — after which the map, pruned against that pose, falls from
+143 landmarks to 60 in the same frame. So the tracker now refuses a solve when fewer than half its
+observations agree with it (`VisualParams::min_inlier_fraction`: ORB-SLAM3's inlier check after pose
+optimization, as a fraction; healthy frames sit at a median of 0.99 and a 5th percentile of 0.85).
+
+That alone was not enough, and the reason is the most instructive bug in this module. A refused
+frame *coasts*, which was meant to dead-reckon on the IMU. But the seed it adopted had its R and p
+overwritten by PnP, and on a frame whose solve was just refused, PnP rotates the pose ~1.7° a frame
+(normal p99: 1.0°). Coast after coast, the attitude walked from 6° to 14° off in 0.3 s; the keyframe
+window then met a 13.5° gyro disagreement (normal: 0.03°) and resolved it by moving the pose 0.4 m
+and writing a 6× velocity. The camera could not object — a pose that fits every pixel can carry any
+velocity. Now a coast adopts the IMU's own prediction, and PnP stays the Gauss-Newton seed, which is
+its job (`EstimatorParams::coast_on_pnp`).
+
+| `estimator_check` | first >1 m | median err |
+|---|---|---|
+| no gate (`--inlier-fraction=0`, as Stage A left it) | 89.0 s | 0.456 m |
+| gate 0.5, coasting on PnP (`--coast-on-pnp`) | never — but lost at 90 s | 0.449 m |
+| **gate 0.5, coasting on the IMU (default)** | **130.5 s** — to the end of the ground truth | 0.540 m over 132 s |
+| gate 0.3 / 0.7, coasting on the IMU | 88.5 s / 88.5 s | 0.451 / 0.474 m |
+
+Read the last row before the bold one. Both mechanisms are fixed for good — the map no longer
+collapses, the attitude no longer walks — but at 0.3 and 0.7 the run still breaks near 88.5 s, so
+130 s is one good outcome of a fragile section, not a solved one. What breaks there *now* is on the
+vision side: at the window solve where the speed jumps, vision's share of the window's starting cost
+is 20–150× normal — the window is handed landmarks that disagree with its keyframes. (Not inserting
+refused frames at all was tried; it starves the map at the 40 s turn and fails at 40 s.)
+
+**So what is next** is still quality: where the fast section's inconsistent landmarks come from, and
+the global inertial refinement above.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
-Schur-complement the oldest keyframe + its landmarks into a **prior** on the remaining window, instead
-of dropping it. This is the hard, essential part of a real VIO backend (where VINS-Mono spends most of
-its backend complexity), and consistency matters: a wrong marginalization injects spurious
-information. Landmarks are marginalized out each step, leaving a dense system over just the $K$
-keyframe states ($15K$, small).
+Schur-complement the oldest keyframe and its landmarks into a **prior** on the remaining window,
+instead of dropping it. This is where VINS-Mono spends most of its backend complexity, and consistency
+matters: a wrong marginalization injects spurious information. The *kernel* is already built and
+exact — `schurMarginalize` in [`marginalization.hpp`](../glass_core/include/glass_core/marginalization.hpp),
+pinned to 2.1e-17 against both the full solve (must match) and the naive hold-fixed solve (must
+differ). Stage B is the bookkeeping around it: what to marginalize, keeping the prior consistent as
+the window slides, not double-counting. Do **not** start here.
 
-The *kernel* is already built and exact — `schurMarginalize` in
-[`marginalization.hpp`](../glass_core/include/glass_core/marginalization.hpp), pinned to 2.1e-17
-against both the full solve (must match) and the naive hold-fixed solve (must differ). What Stage B
-adds is the bookkeeping around it: deciding what to marginalize, keeping the resulting prior
-consistent as the window slides, and not double-counting information. Do **not** start here.
+### Stage C — feature supply for fast motion (demoted)
 
-### Stage C — feature supply for fast motion (independent, smaller)
-
-The fast-motion divergence is partly *supply*: the tracker top-up is gated below `min_features` to
-protect the bootstrap SfM ([Module 3](03-camera.md)), which starves young-track supply during
-tracking. The conflict is **temporal** — SfM runs once at bootstrap; aggressive top-up during tracking
-is harmless. Fix: phase-aware top-up (gentle while bootstrapping, full while tracking). The wrinkle:
-the tracker runs in the node's callback, upstream of the estimator's phase, so making it phase-aware
-and testable in `estimator_check` needs a little plumbing. Separable from the window; can go anytime.
+The tracker's top-up is gated below `min_features` to protect the bootstrap SfM
+([Module 3](03-camera.md)), and it was a suspect for the fast-section divergence. It is now a weak
+one: the `--oracle-map` runs cross that section with the *same* tracker and the *same* supply, and do
+not diverge. Phase-aware top-up is still a sensible cleanup, but it is not the fix.
 
 ---
 
@@ -182,52 +361,76 @@ and testable in `estimator_check` needs a little plumbing. Separable from the wi
   bias pairs (2912 frames vs 50), dropped IMU chains, stale SfM windows, churned KLT ids.
   `estimator_check` removes all of it. When the node fails but the harness does not, it is plumbing,
   not logic.
+- **A real defect is not necessarily the dominant one.** §2's argument was correct and beside the
+  point. Substitute ground truth before you build.
+- **Survival time lies.** An estimator declares a loss when it runs out of features, not when it is
+  wrong — a run can diverge and "track" on for seconds. Score by the first time the error passed
+  1 m; `estimator_check` prints it.
+- **PnP is a seed, not a state.** Adopted unfused on a frame whose solve was just refused, it walked
+  the attitude 8° in 0.3 s. And a pose that fits every pixel can still carry a garbage velocity: a
+  camera does not observe velocity, so a reprojection check can never vouch for one.
+- **`imu_prior_weight` > 1 is not a test of the IMU.** It compounds through the carried covariance
+  and spirals into over-confidence; it diverged even on a ground-truth map. Calibrate the noise
+  densities, never the weight.
+- **The oracle hooks are test-only.** `EstimatorParams::oracle_insert_pose` and
+  `InitializerParams::accel_bias` exist for `estimator_check`. If either is ever set from a launch
+  file, the estimator is cheating.
 - **A count is not a duration.** Every "how many frames" parameter means different seconds at a
   different rate. Derive from the measured rate, never hardcode.
 - **`-UNDEBUG` in CMake is load-bearing.** Release defines `NDEBUG`, which deletes every `assert()` —
   the tests would pass while checking nothing. Already set; do not remove.
 - **Eigen `auto` + `.inverse().translation()` dangles.** Name the type (`-> Eigen::Vector3d`).
 - **Ruler units vs metres.** Only the SfM translation scales by $s$; the extrinsic is already metric.
-  Composing the two Isometries directly mixes them silently.
-- **The scale gate checks CONDITIONING, not accuracy.** 0.06 is tuned for EuRoC V1_01 — re-derive from
-  the uncertainty-vs-accuracy curve on a new sequence.
+- **The scale gate checks CONDITIONING, not accuracy.** 0.06 is tuned for EuRoC V1_01 — re-derive
+  from the uncertainty-vs-accuracy curve on a new sequence.
 
 ---
 
 ## Lab — the measurement discipline itself
 
-`estimator_check` is the highest-leverage tool in the project: it drives the **real** `VioEstimator`
-deterministically (no ROS, no threads, no dropped frames) and writes a 35-column per-frame CSV.
+`estimator_check` drives the **real** `VioEstimator` deterministically (no ROS, no threads, no dropped
+frames) and writes a 58-column per-frame CSV. Past the pose, velocity and bias columns it records
+the latest window solve (landmarks, cost before and after and its split into prior / IMU / vision,
+iterations, how far it moved the newest keyframe, landmarks it triangulated, and its worst IMU
+factor's interval and rotation / velocity / position residuals), why the map's pending tracks did not
+mature that frame, the tracker's fit (median pixel error and inliers), its attitude and gravity error
+against the truth, and how far PnP moved the seed. Error is aligned to ground truth at the bootstrap
+instant — a raw $\lVert\mathbf{p}_{\text{est}}-\mathbf{p}_{\text{gt}}\rVert$ is meaningless because
+the estimator defines its own gravity-aligned world.
 
 ```bash
 colcon build --packages-select glassvio
-./build/glassvio/estimator_check          # writes /tmp/glassvio_run.csv
+./build/glassvio/estimator_check                    # the baseline
+./build/glassvio/estimator_check --oracle-ba        # true b_a at bootstrap
+./build/glassvio/estimator_check --oracle-map       # landmarks from ground-truth poses
+./build/glassvio/estimator_check --parallax=3       # a stricter triangulation gate
 ```
 
-Columns that matter: `pos_err`, `vel_err`, `feats`, `map`, `pending`, `bay`/`gbay` (accel bias est vs
-truth). Error is aligned to ground truth at the bootstrap instant — a raw
-$\lVert\mathbf{p}_{\text{est}}-\mathbf{p}_{\text{gt}}\rVert$ is meaningless because the estimator
-defines its own gravity-aligned world.
+Each prints the gravity tilt at bootstrap, the median position error, and the median
+$\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
 
-1. **Plot `bay` against `gbay`.** Watch the estimated accel bias fail to reach the true value — §3's
-   argument, on your screen. This is the number Stage A must move.
-2. **Plot `vel_err`.** The ~20% under-estimate of §2.1, steady — a *metric* error, not a tracking one
-   (`rmse` stays 2–4 px throughout).
-3. **Add the columns §5 asks for, and try to falsify §3.** Log the gravity error and each axis of
-   $\mathbf{b}_a$ separately, then ask whether the drift tracks a *fixed* miscalibration rather than an
-   unconverged state. This is the step that would have saved glass-lio a rewrite, and it costs a day
-   against Stage A's weeks. Do it before you build the window, not after.
-4. **The habit to keep:** measure here *before* every change and re-measure *after*. Every self-deception
-   this project caught — a bias-prior loosening that made drift worse, a condition-number gate that did
-   not discriminate, a feature-supply hypothesis that was wrong — was caught by this CSV, not by
-   reasoning. That habit is the last thing the course has to teach.
+1. **Reproduce §4's table.** Before reading further, predict each row. Which ones surprised you?
+2. **Plot `bay` against `gbay` from the `--oracle-ba` run.** Seeded at the truth, dragged away from it
+   within seconds. That is what a bias *absorbing* an error looks like — and why a bias that never
+   converges is weak evidence that the bias is the problem.
+3. **Take on Step 0.** Change the camera/IMU weighting and try to move the solved-pose run toward the
+   `--oracle-map` row. You have a measured target, so every attempt is a yes or a no.
+4. **The habit to keep:** measure here *before* every change and re-measure *after*. Every
+   self-deception this project caught — a bias-prior loosening that made drift worse, a
+   condition-number gate that did not discriminate, a feature-supply hypothesis, and finally the
+   accel-bias story itself — was caught by this CSV, not by reasoning. That habit is the last thing
+   the course has to teach.
 
 ---
 
 ## Quick reference
 
 ```bash
-./build/glassvio/estimator_check     # deterministic drive + CSV — measure here first
+./build/glassvio/estimator_check [--oracle-ba|--no-est-ba] [--oracle-map] [--parallax=DEG] \
+                                 [--px-sigma=PX] [--imu-weight=W] [--imu-noise-x=K] \
+                                 [--no-window] [--anchor-gauge] [--kf-every=N] [--window=K] \
+                                 [--window-tri] [--no-map-tri] [--gravity] [--gravity-sigma=DEG] \
+                                 [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

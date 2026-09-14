@@ -79,6 +79,7 @@ since the last frame. A monocular camera has no scale, so the system first **boo
 shape, vision for the gyro bias, a linear alignment that hands the accelerometer's metre to the
 reconstruction (scale, gravity, velocity). Then it **tracks**: a camera reprojection residual and
 an IMU factor in the *same* `NormalEquationsN<15>` glass-lio's LiDAR path uses, over a
-sliding-window landmark map. It bootstraps at metric scale and tracks ~29 s on EuRoC V1_01 at
-0.65 m median drift — with a residual scale bias that [Module 8](08-sliding-window.md) explains and
-a sliding-window BA will fix.
+sliding-window landmark map — and every few frames a keyframe window re-solves the recent poses
+*jointly with the landmarks*, which is what lets the IMU hold the map at metric scale. It tracks
+all 132 s of EuRoC V1_01's ground truth at 0.54 m median drift; [Module 8](08-sliding-window.md) is how the scale loss
+it fixes was traced, and what is still open.
