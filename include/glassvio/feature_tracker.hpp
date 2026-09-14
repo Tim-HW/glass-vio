@@ -44,8 +44,12 @@ public:
   /// Feed one GRAYSCALE frame. Returns the live tracks (points + ids) in this frame.
   Result track(const cv::Mat & gray)
   {
-    if (prev_gray_.empty() || prev_pts_.size() < static_cast<std::size_t>(min_features_)) {
-      // Cold start, or too few survivors to bother flowing -- (re)seed from scratch.
+    if (prev_gray_.empty() || prev_pts_.empty()) {
+      // Cold start: nothing to flow. NOT "too few survivors" -- that once came here too, and
+      // detectInto APPENDS, so the survivors were handed back at the PREVIOUS frame's pixels
+      // under their old ids. Low texture (EuRoC V1_01's mattress wall, 87.5-91 s) kept the
+      // count under min_features for 22 frames running: ~140 points each, 6-14 px stale, and
+      // every tracker solve refused (doc/08 §6).
       detectInto(gray, prev_pts_, ids_);
     } else {
       std::vector<cv::Point2f> tracked;

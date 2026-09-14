@@ -25,11 +25,12 @@ the offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
 
 | metric | per-frame tracker alone | **today's default** (§6) |
 |---|---|---|
-| bootstrap landmark depth | 1.62 m (true room scale) | 1.62 m |
+| bootstrap landmark depth | 1.62 m (true room scale) | 2.01 m (a later bootstrap window: §6) |
 | velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.78 | **~1.00** |
-| tracked | ~29 s | **132 s** — to the end of the ground truth |
-| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.33 m** (over 132 s) |
-| error first passed 1 m | — | **never** — at every tracker gate from 0 to 0.7 (§6) |
+| tracked | ~29 s | **129 s** — from the 15.4 s bootstrap to the end of the ground truth |
+| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.36 m** (over 129 s) |
+| error first passed 1 m | — | **never** — at every tracker gate, with the true bias, with gravity re-estimated (§6) |
+| V1_02_medium / V1_03_difficult, first >1 m | — | 74.2 s / 97.0 s (§6) |
 
 §2–§5 are the story of the left column — how its drift was traced. §6 is the right column.
 
@@ -364,8 +365,38 @@ stale views — and the window keeps ~100 honest ones through the coast. Both ar
 it is the fix, the drop because it is the standard guard against the next source of bad views. The
 drop's threshold is not delicate either — 5, 10, 20 and 40 px all hold at every gate.
 
-**So what is next** is the gravity story (still 4° off at the end: the global inertial refinement
-above), and a second sequence — every number here is V1_01's.
+**The tracker was freezing its own points — found, fixed.** Two runs that should have been *better*
+broke the section again: the true accelerometer bias at bootstrap (`--oracle-ba`, 0.41° of tilt
+instead of 4.04°) passed 1 m at 90.9 s, and `--gravity` at 90.2 s. So gravity was not what the
+section needed, and the global refinement above was not built. Both crossed 87.6–91.3 s mostly
+blind — frame after frame with no tracker solve — and lived or died on how well the IMU coasted.
+The images there show a wall of plain mattresses and curtains: FAST at threshold 20 finds 23–42
+corners where it finds 70–90 elsewhere (at 7: 160–200). Low texture, not blur.
+
+And low texture tripped a bug. `FeatureTracker::track` re-seeded whenever the previous frame had
+fewer than `min_features` (150) tracks — but `detectInto` *appends*, so the survivors went back out
+at the previous frame's pixels, unflowed, under their old ids. Replaying the tracker over V1_01:
+72 frames did it, 22 of them in 87.55–88.96 s alone, each handing the estimator ~140 points a median
+6.5 px (p90 13.4 px) from where KLT says they went. The tracker solve refused those frames —
+correctly — so the blind stretch was largely self-inflicted. Now only a cold start re-seeds; below
+the floor the survivors are flowed and topped up like on any other frame (`test_feature_tracker`
+pins it: the old code reports 0 px of motion for a 3 px shift).
+
+| `estimator_check` | before the fix: first >1 m | after: first >1 m · median err |
+|---|---|---|
+| V1_01, gates 0 / 0.3 / 0.5 / 0.7 | never | never · 0.36–0.37 m |
+| V1_01 `--oracle-ba` | 90.9 s | never · 0.34 m |
+| V1_01 `--gravity` | 90.2 s | never · 0.38 m |
+| V1_02_medium | bootstrap 62.2 s, then 70.5 s | bootstrap 32.9 s, then **74.2 s** · 0.47 m |
+| V1_03_difficult | bootstrap 33.6 s, then 37.0 s (lost at 39 s) | bootstrap 44.4 s, then **97.0 s** · 0.54 m |
+
+The tracker feeds the bootstrap too, so V1_01 now bootstraps at 15.4 s instead of 12.9 s (2.0 m
+median depth, 3.1° tilt) and its medians run over 129 s instead of 132. V1_02 and V1_03 are the
+first numbers from a sequence the estimator was not developed on — and on V1_02 the harness's 60 s
+minimum is out of reach when the bootstrap is at 32.9 s of an 85 s flight.
+
+**So what is next** is the fast sequences: V1_02 passes 1 m at 74.2 s and V1_03 at 97.0 s. And the
+bootstraps take 15–44 s to arrive.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -404,6 +435,10 @@ not diverge. Phase-aware top-up is still a sensible cleanup, but it is not the f
   outlier and re-triangulated is a new point under an old name, and whatever still holds the old
   views — here the keyframe window — is fitting a point that no longer exists. Drop the point, drop
   its views.
+- **Suspect your own front end first.** A "blind stretch" blamed on the scene was 22 frames of the
+  tracker handing back the previous frame's pixels. Replay the front end offline on the real images
+  before blaming blur, texture or the IMU — and a run that gets *worse* with a truer input (here,
+  the true bias) is pointing at something else entirely.
 - **`imu_prior_weight` > 1 is not a test of the IMU.** It compounds through the carried covariance
   and spirals into over-confidence; it diverged even on a ground-truth map. Calibrate the noise
   densities, never the weight.

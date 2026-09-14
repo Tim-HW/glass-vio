@@ -43,7 +43,8 @@ lab behind every claim.
   of ORB-SLAM3's local inertial BA. This is what holds the metric scale (speed ratio 1.02; 0.78
   without it).
 
-It tracks all 132 s of V1_01's ground truth at 0.33 m median error, and the error never passes 1 m.
+It tracks EuRoC V1_01 from its bootstrap to the end of the ground truth at 0.36 m median error,
+never passing 1 m; the faster V1_02 and V1_03 hold to 74 s and 97 s.
 Odometry only — no
 loop closure. What is still open (the accel bias, gravity's tilt, the fast-motion sections) and how
 each was measured is in [doc/08-sliding-window.md](doc/08-sliding-window.md).

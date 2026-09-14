@@ -7,6 +7,7 @@
 //   g++ -std=c++17 -I include test/test_feature_tracker.cpp \
 //       $(pkg-config --cflags --libs opencv4) -o /tmp/tt && /tmp/tt
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <set>
 
@@ -56,5 +57,25 @@ int main()
 
   std::printf("ok: %zu seeded, %zu/%zu survived flow\n",
     a.ids.size(), survived, b.ids.size());
+
+  // BELOW THE FLOOR, survivors must still FLOW. A floor no scene can meet keeps the count under
+  // min_features every frame; the old re-seed branch then handed the survivors back at the
+  // PREVIOUS frame's pixels -- 0 px of motion reported for a 3 px shift.
+  glassvio::FeatureTracker starved(1000, 100000, 20);
+  const auto c = starved.track(makeScene(0));
+  const auto d = starved.track(makeScene(3));
+  std::size_t moved = 0, common = 0;
+  for (std::size_t i = 0; i < d.ids.size(); ++i) {
+    for (std::size_t j = 0; j < c.ids.size(); ++j) {
+      if (c.ids[j] == d.ids[i]) {
+        ++common;
+        moved += std::abs(d.points[i].x - (c.points[j].x - 3.0f)) < 0.5f;
+        break;
+      }
+    }
+  }
+  assert(common > c.ids.size() / 2 && "IDs must persist below the floor too");
+  assert(moved > common * 9 / 10 && "survivors below the floor must be FLOWED, not frozen");
+  std::printf("ok: below the floor, %zu/%zu survivors followed the 3 px shift\n", moved, common);
   return 0;
 }
