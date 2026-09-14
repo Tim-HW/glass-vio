@@ -1,0 +1,14 @@
+ROS package manifest XML schemas, copied without modification from:
+https://github.com/ros-infrastructure/rep/tree/11ca24a41f31480dfb9562ba99f2a5b93d3ebda5/xsd
+
+package_format3.xsd implements REP 149 by Dirk Thomas; package_common.xsd
+contains the common types shared with REP 127 and REP 140.
+These REPs place their specifications in the public domain:
+https://www.ros.org/reps/rep-0149.html#copyright
+https://www.ros.org/reps/rep-0140.html#copyright
+https://www.ros.org/reps/rep-0127.html#copyright
+
+The catalog resolves package.xml's canonical schema URL locally. CTest sets
+XML_CATALOG_FILES to this catalog so ament_xmllint retains schema validation
+without a network dependency. To run the same lint by hand from the repo root:
+  XML_CATALOG_FILES="$PWD/test/schema/catalog.xml" ament_xmllint package.xml

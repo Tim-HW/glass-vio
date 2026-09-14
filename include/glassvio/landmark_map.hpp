@@ -35,6 +35,10 @@ struct LandmarkMapParams
   /// Reprojection error (px) above which an existing landmark is dropped as an outlier. A KLT
   /// mismatch that survives Huber still poisons the map if it stays.
   double max_reprojection_px = 8.0;
+  /// Triangulate pending tracks HERE, from the poses stored with each observation. The keyframe
+  /// window also triangulates, from its optimized poses; false leaves new landmarks to the window
+  /// alone (estimator_check --no-map-tri).
+  bool triangulate = true;
 };
 
 /// THE LOCAL MAP, for landmarks -- glasslio's LocalMap, with points instead of planes.
@@ -73,6 +77,14 @@ public:
   /// and poison the map with points that are geometrically fine and physically meaningless.
   void insert(const FeatureTracker::Result & features, const Eigen::Isometry3d & T_world_cam);
 
+  /// Adopt re-estimated positions -- the keyframe window's bundle adjustment. Ids the map has
+  /// dropped since are ignored: the map's own pruning stays in charge of what exists.
+  void refine(const std::unordered_map<long, Eigen::Vector3d> & refined);
+
+  /// Adopt NEW landmarks triangulated elsewhere -- the keyframe window, from its optimized poses.
+  /// Ids already in the map are left alone; an adopted id's pending observations are dropped.
+  void add(const std::unordered_map<long, Eigen::Vector3d> & fresh);
+
   /// Landmarks the reprojection factor may use: metric, world frame, FIXED during a solve.
   const std::unordered_map<long, Eigen::Vector3d> & landmarks() const {return landmarks_;}
 
@@ -85,6 +97,18 @@ public:
   int lastTriangulated() const {return last_triangulated_;}
   int lastDropped() const {return last_dropped_;}
 
+  /// Why pending tracks did NOT become landmarks on the last insert() -- the diagnostic for
+  /// tracks that pile up without maturing (doc/08 §6).
+  struct TriangulationStats
+  {
+    int attempts = 0;      ///< pending tracks with two or more views, tried this frame
+    int at_infinity = 0;
+    int depth = 0;         ///< behind a camera, or absurdly far
+    int parallax = 0;      ///< rays too close to parallel: WAITING for baseline, not failing
+    int expired = 0;       ///< pending tracks dropped unmatured -- the tracker lost them
+  };
+  const TriangulationStats & lastStats() const {return stats_;}
+
 private:
   struct Observation
   {
@@ -92,9 +116,10 @@ private:
     cv::Point2f px;
   };
 
-  /// Two views of one track, in METRIC world poses -> a metric landmark. False if the parallax
-  /// is too thin, the point is behind either camera, or the depth is absurd.
-  bool triangulate(
+  enum class TriResult { Ok, AtInfinity, Depth, Parallax };
+  /// Two views of one track, in METRIC world poses -> a metric landmark -- or which gate refused
+  /// it: the parallax is too thin, the point is behind either camera, or the depth is absurd.
+  TriResult triangulate(
     const Observation & a, const Observation & b, Eigen::Vector3d & out) const;
 
   CameraCalib calib_;
@@ -106,6 +131,7 @@ private:
   int frame_ = 0;
   int last_triangulated_ = 0;
   int last_dropped_ = 0;
+  TriangulationStats stats_;
 };
 
 }  // namespace glassvio

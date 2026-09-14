@@ -14,6 +14,7 @@ VioEstimator::VioEstimator(const CameraCalib & calib, const EstimatorParams & pa
 {
   init_ = std::make_unique<VioInitializer>(calib_, p_.init);
   map_ = std::make_unique<LandmarkMap>(calib_, p_.map);
+  window_ = KeyframeWindow(p_.window);
 
   // The bias prior is built PER FRAME from the carried covariance + random-walk process noise
   // (see process()), not once here -- glasslio's exact point: a fixed random-walk information
@@ -26,6 +27,8 @@ void VioEstimator::reset()
   frames_.clear();
   imu_ = ImuBuffer();
   map_->clear();
+  window_.clear();
+  since_keyframe_ = 0;
   initialized_ = false;
   lost_ = false;
   warmup_ = 0;
@@ -121,7 +124,7 @@ bool VioEstimator::bootstrap()
   x_.p = T_world_bk.translation();
   x_.v = T_world_c0.linear() * r.velocity_sfm.back();    // stage [4], at that same frame
   x_.bg = r.gyro_bias;                                   // stage [3]
-  // x_.ba stays zero: NOTHING estimates it. P_ below admits that rather than hiding it.
+  x_.ba = r.accel_bias;   // stage [4] when observable, else the bias it integrated at (0)
 
   // The bootstrap's own uncertainty. Emphatically not zero -- an over-confident prior is
   // indistinguishable from a fixed state, which is precisely the failure this design exists
@@ -142,6 +145,19 @@ bool VioEstimator::bootstrap()
   // base. Anchoring at the base would make the first preintegration span the whole window.
   t_prev_ = frames_[last].t;
   warmup_ = p_.warmup_frames;   // the post-bootstrap id-churn hole is exactly what this rides out
+
+  // The bootstrap frame is the window's first keyframe -- its anchor, until the window slides.
+  window_.clear();
+  since_keyframe_ = 0;
+  if (p_.window.enabled) {
+    Keyframe kf;
+    kf.t = frames_[last].t;
+    kf.x = x_;
+    for (const auto & o : frames_[last].by_id) {
+      kf.obs.emplace(o.first, o.second);
+    }
+    window_.push(std::move(kf));
+  }
   initialized_ = true;
   return true;
 }
@@ -193,6 +209,16 @@ bool VioEstimator::pnpFromMap(
   out.R = Sophus::SO3d(Sophus::SO3d::fitToSO3(T_world_imu.linear()));
   out.p = T_world_imu.translation();
   return true;
+}
+
+void VioEstimator::insertFrame(
+  const FeatureTracker::Result & features, double t, const Eigen::Isometry3d & T_world_body)
+{
+  Eigen::Isometry3d T = T_world_body;
+  if (p_.oracle_insert_pose && !p_.oracle_insert_pose(t, T)) {
+    T = T_world_body;   // the oracle declined (e.g. no alignment yet): use the solved pose
+  }
+  map_->insert(features, T * calib_.T_cam_imu.inverse());
 }
 
 // =================================================================================
@@ -287,7 +313,7 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
       Eigen::Isometry3d T_wc = Eigen::Isometry3d::Identity();
       T_wc.linear() = x_.R.matrix();
       T_wc.translation() = x_.p;
-      map_->insert(group.features, T_wc * calib_.T_cam_imu.inverse());
+      insertFrame(group.features, t, T_wc);
       out.stage = FrameResult::Stage::Tracking;
       out.pose_trusted = true;
       out.pose = T_wc;
@@ -305,9 +331,12 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
   // reads the pose straight off the map with no time base, so it is immune to the gap. Use it
   // for R and p when it succeeds; velocity and biases stay with predictState, which PnP cannot
   // see. This makes the handoff robust without special-casing "the first frame".
-  NavState guess = predictState(x_, pre, gravity_world_);
+  const NavState predicted = predictState(x_, pre, gravity_world_);
+  NavState guess = predicted;
   NavState pnp;
   if (pnpFromMap(obs, pnp)) {
+    out.pnp_jump_deg = (guess.R.inverse() * pnp.R).log().norm() * 180.0 / M_PI;
+    out.pnp_jump_m = (pnp.p - guess.p).norm();
     guess.R = pnp.R;
     guess.p = pnp.p;
   }
@@ -352,12 +381,15 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
     // repopulates with live ids, and vision takes back over once it can.
     if (warmup_ > 0) {
       --warmup_;
-      x_ = guess;
+      // Dead-reckon on the IMU, NOT on the PnP-replaced seed: see EstimatorParams::coast_on_pnp.
+      x_ = p_.coast_on_pnp ? guess : predicted;
       t_prev_ = t;
       Eigen::Isometry3d T_wc = Eigen::Isometry3d::Identity();
       T_wc.linear() = x_.R.matrix();
       T_wc.translation() = x_.p;
-      map_->insert(group.features, T_wc * calib_.T_cam_imu.inverse());
+      if (!res.refused || p_.coast_insert_refused) {
+        insertFrame(group.features, t, T_wc);
+      }
       out.stage = FrameResult::Stage::Tracking;
       out.pose_trusted = true;   // IMU dead reckoning over a few frames is trustworthy
       out.pose = T_wc;
@@ -387,11 +419,10 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
   //
   // And this is where the ruler stays dead: x_ is metric, so triangulation yields metres with
   // no scale, no alignment and no gauge. Stage [2]'s invented baseline was a one-time cost.
-  Eigen::Isometry3d T_world_cam = Eigen::Isometry3d::Identity();
-  T_world_cam.linear() = x_.R.matrix();
-  T_world_cam.translation() = x_.p;
-  T_world_cam = T_world_cam * calib_.T_cam_imu.inverse();
-  map_->insert(group.features, T_world_cam);
+  Eigen::Isometry3d T_world_body = Eigen::Isometry3d::Identity();
+  T_world_body.linear() = x_.R.matrix();
+  T_world_body.translation() = x_.p;
+  insertFrame(group.features, t, T_world_body);
 
   // Carry the posterior. res.H is every factor's accumulated information, so its inverse IS
   // the new covariance -- what NormalEquationsN::H() has always been for. LDLT because H is
@@ -403,6 +434,41 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
     P_ = P_new;
   }
 
+  // --- STAGE A: every few frames this one becomes a keyframe, and the window re-solves the
+  // last ~10 keyframes JOINTLY with their landmarks. The map adopts the refined landmarks and
+  // the tracker resumes from the refined state -- the IMU has now moved the map, not just the
+  // pose. P_ stays the tracker's own: the window's covariance is relative to its anchor, and
+  // handing it over would loosen Sigma_eff and weaken the IMU in tracking (doc/08 §6, Step 0).
+  if (p_.window.enabled && ++since_keyframe_ >= p_.window.keyframe_every) {
+    since_keyframe_ = 0;
+    Keyframe kf;
+    kf.t = t;
+    kf.x = x_;
+    for (std::size_t i = 0; i < group.features.ids.size(); ++i) {
+      kf.obs.emplace(group.features.ids[i], group.features.points[i]);
+    }
+    window_.push(std::move(kf));
+    last_window_ = window_.optimize(
+      map_->landmarks(), imu_, calib_, p_.visual.reproj, gravity_world_);
+    if (last_window_.ok) {
+      ++window_solves_;
+      map_->refine(last_window_.refined);
+      // New landmarks from the OPTIMIZED keyframe poses, when WindowParams::triangulate is on --
+      // off by default, because measured it made things worse (doc/08 §6).
+      const auto fresh = window_.triangulate(
+        map_->landmarks(), calib_, p_.visual.reproj.min_depth);
+      map_->add(fresh);
+      last_window_.triangulated = static_cast<int>(fresh.size());
+      window_triangulated_ += last_window_.triangulated;
+      if (p_.window.estimate_gravity) {
+        gravity_world_ = last_window_.gravity;   // the tracker uses it from the next frame on
+      }
+      x_ = window_.keyframes().back().x;
+    } else {
+      ++window_refusals_;
+    }
+  }
+
   out.stage = FrameResult::Stage::Tracking;
   out.pose_trusted = true;
   out.pose.linear() = x_.R.matrix();
@@ -410,6 +476,8 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
   out.velocity = x_.v;
   out.features = res.features;
   out.rmse_px = res.rmse_px;
+  out.median_px = res.median_px;
+  out.inliers = res.inliers;
   return out;
 }
 

@@ -137,7 +137,14 @@ class ImuBuffer
 public:
   static constexpr double kDefaultMaxGap = 0.02;   ///< s; larger dt means the stream dropped
 
-  void add(const StampedImu & s) {samples_.push_back(s);}
+  // Adjacent synchronized groups share their bracket samples. Ignore those replays so
+  // binary searches always see a strictly increasing timeline.
+  void add(const StampedImu & s)
+  {
+    if (std::isfinite(s.t) && (samples_.empty() || s.t > samples_.back().t)) {
+      samples_.push_back(s);
+    }
+  }
 
   /// Preintegrate [t0, t1) at the given bias. False if the stream has a hole inside, or if
   /// the interval is empty.
@@ -149,16 +156,15 @@ public:
     double max_gap = kDefaultMaxGap) const
   {
     out = glass_core::ImuPreintegration(bias_gyro, bias_accel, gyro_noise, accel_noise);
-
-    auto it = std::lower_bound(
+    if (!continuous(t0, t1, max_gap)) {
+      return false;
+    }
+    auto it = std::upper_bound(
       samples_.begin(), samples_.end(), t0,
-      [](const StampedImu & s, double v) {return s.t < v;});
-
-    for (; it != samples_.end() && (it + 1) != samples_.end() && it->t < t1; ++it) {
-      const double dt = (it + 1)->t - it->t;
-      if (dt > max_gap) {
-        return false;
-      }
+      [](double v, const StampedImu & s) {return v < s.t;});
+    --it;   // continuous() established the left and right brackets.
+    for (; it->t < t1; ++it) {
+      const double dt = std::min(t1, (it + 1)->t) - std::max(t0, it->t);
       out.integrate(it->gyro, it->accel, dt);
     }
     return out.dt() > 1e-9;
@@ -168,11 +174,20 @@ public:
   /// before doing the work.
   bool continuous(double t0, double t1, double max_gap = kDefaultMaxGap) const
   {
-    auto it = std::lower_bound(
+    if (!std::isfinite(t0) || !std::isfinite(t1) || t1 <= t0 ||
+      !std::isfinite(max_gap) || max_gap <= 0.0 || samples_.size() < 2 ||
+      samples_.front().t > t0 || samples_.back().t < t1)
+    {
+      return false;
+    }
+    auto it = std::upper_bound(
       samples_.begin(), samples_.end(), t0,
-      [](const StampedImu & s, double v) {return s.t < v;});
-    for (; it != samples_.end() && (it + 1) != samples_.end() && it->t < t1; ++it) {
-      if ((it + 1)->t - it->t > max_gap) {
+      [](double v, const StampedImu & s) {return v < s.t;});
+    --it;
+    for (; it->t < t1; ++it) {
+      if ((it + 1)->t - it->t > max_gap ||
+        !it->gyro.allFinite() || !it->accel.allFinite())
+      {
         return false;
       }
     }

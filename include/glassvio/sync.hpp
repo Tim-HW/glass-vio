@@ -97,10 +97,10 @@ public:
     // consecutive samples, so it needs the one at/before t_prev to have a left edge.
     for (const auto & m : imu_) {
       const double t = stamp(m->header);
-      if (t > t_cur) {
+      out.imu.push_back(m);
+      if (t >= t_cur) {
         break;
       }
-      out.imu.push_back(m);
     }
 
     t_prev_ = t_cur;

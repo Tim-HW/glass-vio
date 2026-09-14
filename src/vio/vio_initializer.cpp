@@ -118,23 +118,30 @@ bool VioInitializer::align(
       return R_cam(k) * calib_.T_cam_imu.linear();
     };
 
-  // Unknowns: [v_0 .. v_n (3 each), g (3), s (1)]. Every equation below is LINEAR in all of
-  // them, which is why this is one least-squares solve and not an optimisation.
-  const int dim = 3 * n + 3 + 1;
+  // Unknowns: [v_0 .. v_n (3 each), g (3), s (1), db_a (3)]. Every equation below is LINEAR in
+  // all of them, which is why this is one least-squares solve and not an optimisation.
+  //
+  // db_a STAYS LINEAR. The deltas are integrated at a FIXED bias b0 (p_.accel_bias), and
+  // preintegration carries how they move when the bias does -- dp(b0 + db) = dp + dp_dba db, the
+  // same first-order correction the tracker's IMU factor uses. So the accel bias is three more
+  // columns, not an iteration. Without them b_a is pinned at b0, and whatever EuRoC's 0.55 m/s^2
+  // does to the fit has nowhere to go but into s, g and v.
+  const int dim = 3 * n + 3 + 1;   // without db_a
   const int gi = 3 * n;
   const int si = 3 * n + 3;
+  const int bai = 3 * n + 4;
+  const int dim_ba = dim + 3;      // with db_a
 
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6 * (n - 1), dim);
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6 * (n - 1), dim_ba);
   Eigen::VectorXd b = Eigen::VectorXd::Zero(6 * (n - 1));
   int row = 0;
   int intervals = 0;
 
   for (int a = 0; a + 1 < n; ++a) {
     const int k0 = out.frames[a], k1 = out.frames[a + 1];
-    ImuPreintegration pre(gyro_bias, Eigen::Vector3d::Zero(), calib_.gyro_noise,
-      calib_.accel_noise);
+    ImuPreintegration pre(gyro_bias, p_.accel_bias, calib_.gyro_noise, calib_.accel_noise);
     if (!imu.preintegrate(
-        frames[k0].t, frames[k1].t, gyro_bias, Eigen::Vector3d::Zero(), pre,
+        frames[k0].t, frames[k1].t, gyro_bias, p_.accel_bias, pre,
         calib_.gyro_noise, calib_.accel_noise))
     {
       continue;
@@ -146,6 +153,7 @@ bool VioInitializer::align(
     A.block<3, 3>(row, 3 * a) = -Eigen::Matrix3d::Identity() * dt;
     A.block<3, 3>(row, gi) = -0.5 * Eigen::Matrix3d::Identity() * dt * dt;
     A.block<3, 1>(row, si) = p_cam(k1) - p_cam(k0);
+    A.block<3, 3>(row, bai) = -Rb0 * pre.dp_dba();   // Rb0 dp(b0 + db), moved to the left
     b.segment<3>(row) = Rb0 * pre.dp() - (R_cam(k1) - R_cam(k0)) * t_ci;
     row += 3;
 
@@ -153,6 +161,7 @@ bool VioInitializer::align(
     A.block<3, 3>(row, 3 * a) = -Eigen::Matrix3d::Identity();
     A.block<3, 3>(row, 3 * (a + 1)) = Eigen::Matrix3d::Identity();
     A.block<3, 3>(row, gi) = -Eigen::Matrix3d::Identity() * dt;
+    A.block<3, 3>(row, bai) = -Rb0 * pre.dv_dba();   // Rb0 dv(b0 + db), moved to the left
     b.segment<3>(row) = Rb0 * pre.dv();
     row += 3;
     ++intervals;
@@ -165,7 +174,45 @@ bool VioInitializer::align(
   A.conservativeResize(row, Eigen::NoChange);
   b.conservativeResize(row);
 
-  const Eigen::VectorXd x = A.colPivHouseholderQr().solve(b);
+  // One solve over the first `cols` columns, plus what the gates need: the residual variance and
+  // (A^T A)^-1, the marginal covariance up to that variance.
+  struct Solution
+  {
+    Eigen::VectorXd x;
+    double sigma2 = 0.0;
+    Eigen::MatrixXd N_inv;
+  };
+  const auto solve = [&](int cols) -> Solution {
+      const Eigen::MatrixXd Ak = A.leftCols(cols);
+      Solution s;
+      s.x = Ak.colPivHouseholderQr().solve(b);
+      s.sigma2 = (Ak * s.x - b).squaredNorm() / static_cast<double>(std::max(1, row - cols));
+      s.N_inv = (Ak.transpose() * Ak).inverse();
+      return s;
+    };
+
+  // B_A OBSERVABILITY -- the same kind of gate the scale gets below. b_a enters the dv rows as
+  // ~ -R_b dt b_a and gravity as -dt g: without ROTATION in the window they are the same column
+  // and b_a is indistinguishable from a tilt of g. Its marginal std catches exactly that ridge;
+  // when it is too wide, drop the three columns and fall back to b0 rather than let a phantom
+  // bias soak up gravity.
+  Solution sol;
+  out.accel_bias = p_.accel_bias;
+  out.accel_bias_estimated = false;
+  out.accel_bias_std = 0.0;
+  if (p_.estimate_accel_bias) {
+    sol = solve(dim_ba);
+    out.accel_bias_std = std::sqrt(
+      std::max(0.0, sol.sigma2 * sol.N_inv.diagonal().segment<3>(bai).maxCoeff()));
+    if (sol.x.allFinite() && out.accel_bias_std < p_.max_accel_bias_std) {
+      out.accel_bias = p_.accel_bias + sol.x.segment<3>(bai);
+      out.accel_bias_estimated = true;
+    }
+  }
+  if (!out.accel_bias_estimated) {
+    sol = solve(dim);
+  }
+  const Eigen::VectorXd & x = sol.x;
   if (!x.allFinite()) {
     return false;
   }
@@ -184,11 +231,7 @@ bool VioInitializer::align(
   // the exact ridge that lets a bad window fake a fit. Dimensionless, so it needs no
   // per-dataset threshold. The raw condition number of A does NOT work here: its columns span
   // dt, dt^2 and ruler units, so its conditioning measures column scaling, not observability.
-  const Eigen::VectorXd resid = A * x - b;
-  const int dof = std::max(1, row - dim);
-  const double sigma2 = resid.squaredNorm() / static_cast<double>(dof);
-  const Eigen::MatrixXd N_inv = (A.transpose() * A).inverse();
-  const double var_s = sigma2 * N_inv(si, si);
+  const double var_s = sol.sigma2 * sol.N_inv(si, si);
   out.scale_uncertainty =
     std::sqrt(std::max(0.0, var_s)) / std::max(std::abs(out.scale), 1e-9);
   out.velocity_sfm.clear();

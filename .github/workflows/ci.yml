@@ -1,0 +1,76 @@
+name: ROS Jazzy CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      MAKEFLAGS: '-j2'
+      # The full bag + ASL ground truth archive total about 2.3 GB on a cold cache.
+      EUROC_TEST: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'ON' || 'OFF' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+      - name: Install package dependencies
+        run: |
+          sudo apt-get install -y python3-venv unzip
+          rosdep install --from-paths . --ignore-src --rosdistro jazzy -y
+      - name: Restore EuRoC sensors and ground truth
+        if: env.EUROC_TEST == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/vicon_room1/V1_01_easy/V1_01_easy_ros2
+            data/vicon_room1/V1_01_easy/gt
+          key: euroc-v1-01-easy-rosbags-0.10.11-${{ hashFiles('scripts/download_bag.sh') }}
+      - name: Prepare EuRoC dataset
+        if: env.EUROC_TEST == 'ON'
+        run: |
+          python3 -m venv /tmp/glassvio-rosbags
+          /tmp/glassvio-rosbags/bin/pip install rosbags==0.10.11
+          export PATH="/tmp/glassvio-rosbags/bin:$PATH"
+          ./scripts/download_bag.sh
+      - name: Build Release with assertions enabled in tests
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --base-paths . --packages-select glassvio \
+            --event-handlers console_direct+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DGLASSVIO_EUROC_TEST="$EUROC_TEST"
+      - name: Run unit tests, lint and enabled dataset regression
+        run: |
+          source install/setup.bash
+          colcon test --packages-select glassvio --event-handlers console_direct+ \
+            --return-code-on-test-failure
+      - name: Summarize test results
+        if: always()
+        run: colcon test-result --verbose
+      - name: Upload test logs and trajectory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jazzy-test-results
+          path: |
+            log/
+            build/glassvio/Testing/
+            build/glassvio/test_results/
+            build/glassvio/*.csv

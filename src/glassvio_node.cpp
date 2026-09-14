@@ -1,52 +1,14 @@
-// GlassVIO -- visual-inertial odometry sharing GlassLIO's estimation engine.
+// ROS adapter: image callbacks track features, MeasureQueue synchronizes and orders
+// measurements, and one worker owns VioEstimator. The numerical engine is glass_core;
+// the estimator uses ROS message types but has no subscriptions or threads.
 //
-// THE NODE IS ROS, AND NOTHING ELSE. It subscribes, tracks, syncs, hands work to a worker, and
-// publishes what comes back. The estimation lives in glass_core (the solver, the IMU factor,
-// preintegration) and the pipeline in VioEstimator -- neither knows ROS exists.
-//
-//   image cb (own group)        queue            worker
-//   ────────────────────    ─────────────       ────────
-//   track → sync         ──►  MeasureGroup  ──►  collect → bootstrap → track
-//   (FeatureTracker,          (bounded)          (VioEstimator)
-//    MeasureSync, buf_mutex_)
-//   imu cb (own group)  ──►  sync
-//
-// WHY THE TRACKER IS IN THE CALLBACK AND NOT THE WORKER -- the one place this must NOT copy
-// glasslio. glasslio's queue drops the oldest scan when the worker falls behind, and that is
-// safe: ICP registers against the MAP, which is stateless with respect to the scan that was
-// skipped. KLT is not. The tracker's entire state IS the previous frame, so dropping an image
-// sends it from N to N+2: the flow doubles, calcOpticalFlowPyrLK fails its error threshold,
-// tracks die, and IDs churn -- which is precisely what FeatureTracker exists to prevent.
-//
-// So the tracker sits where nothing is ever dropped, and the queue carries its OUTPUT instead:
-// 23 KB of tracks rather than a 455 KB frame (19x), and a dropped group then costs
-// observations rather than the tracker's state, because the surviving frames still share IDs
-// across the gap.
-//
-// WHY THAT DOES NOT RE-BREAK IMU INTAKE. Doing work in a callback is what glasslio documents
-// having got wrong ("a latency problem turned into DATA LOSS"). The fix is not to move the work
-// but to stop it sharing a thread with the IMU: each subscription gets its own MUTUALLY
-// EXCLUSIVE callback group, run on a MultiThreadedExecutor. Tracking measures ~1.3 ms/frame, so
-// it never approaches EuRoC's 50 ms budget -- but the IMU is 200 Hz there, and preintegration
-// needs EVERY sample: a dropped one is not noisy, it is missing, and the delta is silently
-// short.
-//
-// NO ImuInit. glass_core's static-window bootstrap assumes the sensor was at REST -- an
-// assumption a MAV never honours, and which on KITTI produced a "bias" that was really the
-// car's yaw rate (3.9x worse than using zero). VioEstimator needs no such assumption: it reads
-// the gyro bias off vision's rotations and gravity out of a linear solve.
-//
-// OWNERSHIP IS THE INVARIANT (copied from glasslio, deliberately):
-//   * `tracker_` -- touched ONLY by the image callback.
-//   * `estimator_` -- touched ONLY by the worker.
-//   * `sync_` -- touched only under `buf_mutex_`.
-//   * the queue is the single hand-off point.
+// Tracking stays before the bounded worker queue so dropped observations do not skip
+// KLT input frames. IMU and image callbacks have separate mutually exclusive groups.
+// MeasureQueue holds one mutex across synchronization and enqueue, then releases it
+// before estimation. Dropped observations retain their IMU samples.
 
 #include <cmath>
-#include <condition_variable>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 
@@ -62,7 +24,7 @@
 
 #include "glassvio/camera_calib.hpp"
 #include "glassvio/feature_tracker.hpp"
-#include "glassvio/sync.hpp"
+#include "glassvio/measure_queue.hpp"
 #include "glassvio/types.hpp"
 #include "glassvio/vio_estimator.hpp"
 
@@ -115,7 +77,7 @@ public:
 
     // Bounded: if the worker falls behind, drop the OLDEST group rather than let latency grow
     // without bound. A stale pose is useless.
-    max_queue_ = static_cast<std::size_t>(declare_parameter<int>("max_queue_size", 3));
+    measurements_ = std::make_unique<MeasureQueue>(declare_parameter<int>("max_queue_size", 3));
 
     // SEPARATE, MUTUALLY EXCLUSIVE CALLBACK GROUPS. This is what lets the tracker run in the
     // image callback without starving the IMU: on the default single-threaded executor the two
@@ -149,11 +111,7 @@ public:
 
   ~GlassVioNode() override
   {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      stop_ = true;
-    }
-    queue_cv_.notify_all();
+    measurements_->stop();
     if (worker_.joinable()) {
       worker_.join();
     }
@@ -166,11 +124,7 @@ private:
 
   void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr & msg)
   {
-    {
-      std::lock_guard<std::mutex> lock(buf_mutex_);
-      sync_.pushImu(msg);
-    }
-    enqueueReady();
+    warnDropped(measurements_->pushImu(msg));
   }
 
   /// Tracks HERE, not in the worker: the queue may drop a group, and a sequential KLT cannot
@@ -195,11 +149,7 @@ private:
     // feature moves 155 px. A no-op on a rectified stream.
     r.points = calib_.undistort(r.points);
 
-    {
-      std::lock_guard<std::mutex> lock(buf_mutex_);
-      sync_.pushFrame(msg->header, std::move(r));
-    }
-    enqueueReady();
+    warnDropped(measurements_->pushFrame(msg->header, std::move(r)));
   }
 
   void publishFeatures(
@@ -218,64 +168,20 @@ private:
     pub_features_->publish(*out.toImageMsg());
   }
 
-  /// Move every releasable group onto the queue. Called from both callbacks because either
-  /// arrival can complete a group: a frame completes one waiting for its own stamp, and an IMU
-  /// sample completes one waiting to be crossed.
-  void enqueueReady()
+  void warnDropped(std::size_t dropped)
   {
-    MeasureGroup group;
-    for (;; ) {
-      {
-        std::lock_guard<std::mutex> lock(buf_mutex_);
-        if (!sync_.next(group)) {
-          return;
-        }
-      }
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.push_back(std::move(group));
-        if (queue_.size() > max_queue_) {
-          // DROP THE FRAME, KEEP ITS IMU. glasslio can discard a whole MeasureGroup because a
-          // dropped scan is simply a missed measurement -- ICP re-registers the next one
-          // against the map. Here the IMU is a CHAIN: each group carries [t_prev, t_cur], and
-          // losing one punches a hole that preintegration must then refuse to cross
-          // (ImuBuffer's gap check fires, and rightly). Splicing the samples onto the next
-          // group keeps the chain unbroken while still dropping the expensive part -- the
-          // frame's observations.
-          //
-          // The boundary sample ends up duplicated (both groups hold the one at t_cur), which
-          // is harmless: it yields dt = 0 and integrate() returns early on that.
-          MeasureGroup dropped = std::move(queue_.front());
-          queue_.pop_front();
-          auto & next = queue_.front();
-          next.imu.insert(next.imu.begin(), dropped.imu.begin(), dropped.imu.end());
-          RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "worker behind -- dropping oldest frame's observations, keeping its IMU "
-            "(queue %zu)", max_queue_);
-        }
-      }
-      queue_cv_.notify_one();
+    if (dropped > 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "worker behind -- dropped %zu old observations, keeping their IMU", dropped);
     }
   }
 
-  // =========================================================================
-  // Worker thread: the ESTIMATION. Owns estimator_ (never tracker_).
-  // =========================================================================
-
+  // Estimator state belongs exclusively to this worker.
   void workerLoop()
   {
-    for (;; ) {
-      MeasureGroup group;
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this] {return !queue_.empty() || stop_;});
-        if (stop_ && queue_.empty()) {
-          return;
-        }
-        group = std::move(queue_.front());
-        queue_.pop_front();
-      }
+    MeasureGroup group;
+    while (measurements_->waitPop(group)) {
       handleFrame(group);
     }
   }
@@ -304,9 +210,7 @@ private:
         break;
 
       case FrameResult::Stage::Lost:
-        // EXPECTED, and not hidden. Landmarks are triangulated once and held fixed, so the
-        // camera eventually flies past all of them (~2.5 s on EuRoC V1_01). A sliding window
-        // is what fixes this; a looser min_features would only hide it.
+        // Loss is terminal for this run; restart the node to collect a new bootstrap.
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "LOST -- only %d landmarks in view. With the map maintained this means the tracker "
@@ -367,16 +271,7 @@ private:
   std::unique_ptr<FeatureTracker> tracker_;
   CameraCalib calib_;
 
-  // --- callback-owned, under buf_mutex_
-  MeasureSync sync_;
-  std::mutex buf_mutex_;
-
-  // --- the hand-off
-  std::deque<MeasureGroup> queue_;
-  std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
-  std::size_t max_queue_ = 3;
-  bool stop_ = false;
+  std::unique_ptr<MeasureQueue> measurements_;
   std::thread worker_;
 
   // --- worker-owned. Touched by nothing else.

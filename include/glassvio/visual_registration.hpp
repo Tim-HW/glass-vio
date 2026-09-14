@@ -30,6 +30,14 @@ struct VisualParams
   /// Scales the IMU's own information. 0 would make this pure vision -- useful for measuring
   /// what the IMU actually buys, which is the only honest way to justify tight coupling.
   double imu_prior_weight = 1.0;
+  /// Pixel error at or below which an observation AGREES with the solved pose -- the map's own
+  /// outlier bound (LandmarkMapParams::max_reprojection_px). Counted into VisualResult::inliers.
+  double inlier_px = 8.0;
+  /// A solve is REFUSED when fewer than this fraction of its observations agree with it (within
+  /// inlier_px) -- ORB-SLAM3's inlier count after pose optimization, as a fraction. Measured on
+  /// EuRoC V1_01: healthy frames sit at a median of 0.99 and a 5th percentile of 0.85; the solve
+  /// that started the 87.6 s divergence had 1 inlier of 94. 0 disables.
+  double min_inlier_fraction = 0.5;
 };
 
 struct VisualResult
@@ -44,6 +52,13 @@ struct VisualResult
   int features = 0;         ///< landmarks that contributed (in view AND in front)
   int rejected_cheirality = 0;
   double rmse_px = 0.0;     ///< VISION-only, in pixels, so it is directly interpretable
+  /// The fit at the FINAL state, robustly. rmse_px is a mean taken before the last step, so a
+  /// few wild tracks read as a blow-up under a good pose; these say how much of the view agrees.
+  double median_px = 0.0;
+  int inliers = 0;          ///< observations within VisualParams::inlier_px
+  /// The inlier gate refused it: it converged, but too little of the view agreed. Distinct from
+  /// a STARVED solve (too few features), which is invalid for a different reason.
+  bool refused = false;
   NavState state;
   Eigen::Matrix<double, kNavDim, kNavDim> H = Eigen::Matrix<double, kNavDim, kNavDim>::Zero();
 };

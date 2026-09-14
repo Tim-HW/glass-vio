@@ -105,6 +105,16 @@ inline PixelJacobian reprojectionJacobian(
   return J;
 }
 
+/// d r / d P_w -- the landmark block bundle adjustment needs (keyframe_window.cpp). No new
+/// derivation: P_i = R^T (P_w - p) depends on P_w and p only through their difference, so it is
+/// exactly the NEGATIVE of the position block -- a landmark moving is the camera moving the other
+/// way. Takes the pose Jacobian so whatever whitening it carries carries over. Pinned anyway in
+/// test_reprojection.cpp: a sign slip in a copied block is the cheapest bug there is.
+inline Eigen::Matrix<double, 2, 3> reprojectionLandmarkJacobian(const PixelJacobian & J_pose)
+{
+  return -J_pose.block<2, 3>(0, kIdxPos);
+}
+
 /// Fold one tracked feature into the normal equations.
 ///
 /// TWO addScalar CALLS, NOT addBlock<2>, and it is an identity rather than a hack. The proper

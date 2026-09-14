@@ -1,6 +1,7 @@
 #ifndef GLASSVIO_VIO_ESTIMATOR_HPP
 #define GLASSVIO_VIO_ESTIMATOR_HPP
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 
 #include "glassvio/camera_calib.hpp"
 #include "glassvio/dataset.hpp"
+#include "glassvio/keyframe_window.hpp"
 #include "glassvio/landmark_map.hpp"
 #include "glassvio/types.hpp"
 #include "glassvio/vio_initializer.hpp"
@@ -49,6 +51,17 @@ struct EstimatorParams
   /// short coast is cheap; replenished on every successful solve, so it also rides out a
   /// transient dip (a blank wall, a hard turn).
   int warmup_frames = 20;
+  /// While coasting, insert a frame whose tracker solve the inlier gate REFUSED, at the coasted
+  /// (unverified) pose. A STARVED frame is always inserted -- that is how the map repopulates
+  /// after the bootstrap. (estimator_check --no-refused-insert to compare.)
+  bool coast_insert_refused = true;
+  /// On a coast frame, adopt the PnP-replaced seed rather than the IMU's own prediction. A coast
+  /// is meant to dead-reckon on the IMU; but PnP overwrites R and p in the seed first, and on a
+  /// frame whose solve was just refused it rotates the pose ~1.7 deg a frame (normal p99: 1.0).
+  /// Adopted frame after frame, that walked the attitude from 6 to 14 deg in 0.3 s on EuRoC V1_01
+  /// -- the 13.5 deg gyro disagreement that then broke the keyframe window at 88.1 s. PnP stays
+  /// the Gauss-Newton seed, which is its job. (estimator_check --coast-on-pnp to compare.)
+  bool coast_on_pnp = false;
   /// THE SLIDING WINDOW. Landmarks are maintained rather than frozen: triangulated as tracks
   /// mature against the (metric) state, dropped when they leave view or stop fitting. Without
   /// it, tracking starved after ~4 s with 0 landmarks in view -- measured, not predicted.
@@ -56,6 +69,11 @@ struct EstimatorParams
   /// Stage [2]'s window is a SUBSET of what is collected. Leave it short.
   InitializerParams init;
   VisualParams visual;
+  /// STAGE A -- the keyframe window (keyframe_window.hpp, doc/08-sliding-window.md §5-6). Every
+  /// few tracked frames one becomes a keyframe, and the last ~10 are re-solved JOINTLY with the
+  /// landmarks they see: the one place the IMU gets to move the map, which is what breaks the
+  /// solved-pose -> map -> pose loop that shrinks the scale.
+  WindowParams window;
 
   /// The bootstrap's own uncertainty, as standard deviations. NOT zero, and the temptation to
   /// make it small is the bug this whole design exists to avoid: an over-confident prior is
@@ -66,15 +84,23 @@ struct EstimatorParams
   double sigma_position_m = 0.05;
   double sigma_velocity_mps = 0.10;
   double sigma_gyro_bias = 2.0e-3;
-  /// MODERATE, and the story here is a real measured limit. EuRoC's b_a is 0.55 m/s^2 and we
-  /// seed it at 0, so the instinct is a loose prior to let the solve reach it (OpenVINS's
-  /// init_dyn_inflation_ba: 100). Measured across 0.1 / 0.4 / 1.0, b_a NEVER converges to
-  /// 0.55 -- it is only weakly observable per frame (dv/db_a ~ dt ~ 0.05), so a loose prior
-  /// only lets it WANDER and absorb the bootstrap's velocity/scale error, which made drift
-  /// WORSE (0.27 m at 0.1 -> 1.98 m at 1.0). A single-frame solve cannot pin a weakly-observable
-  /// bias; that is the sliding window's job. So this stays moderate: loose enough to adapt if
-  /// excitation is genuinely strong, tight enough not to soak up error to avoid declaring LOST.
+  /// MODERATE, and the story here is a real measured limit. EuRoC's b_a is 0.55 m/s^2 and stage
+  /// [4] can rarely estimate it (InitializerParams::estimate_accel_bias), so it is usually seeded
+  /// at 0 and the instinct is a loose prior to let the solve reach it (OpenVINS's
+  /// init_dyn_inflation_ba: 100). Measured across 0.1 / 0.4 / 1.0, b_a NEVER converges to 0.55 --
+  /// it is only weakly observable per frame (dv/db_a ~ dt ~ 0.05), so a loose prior only lets it
+  /// WANDER and absorb whatever else is wrong, which made drift WORSE (0.27 m at 0.1 -> 1.98 m at
+  /// 1.0). What else is wrong was later measured: seeded at the TRUE 0.548 (estimator_check
+  /// --oracle-ba), tracking still drags it to -0.25, soaking up the scale the map loses as it is
+  /// triangulated from solved poses (doc/08-sliding-window.md §4). So this stays moderate: loose
+  /// enough to adapt, tight enough not to soak up that error.
   double sigma_accel_bias = 0.2;
+
+  /// TEST ORACLE ONLY -- estimator_check --oracle-map; the node never sets it. When set and it
+  /// returns true, map insertion uses the world-frame BODY pose it writes for time t instead of
+  /// the solved one, so new landmarks triangulate from ground truth. That splits "the map's own
+  /// growth shrinks the scale" (poses feed triangulation feed poses) from "the solve does".
+  std::function<bool(double t, Eigen::Isometry3d & T_world_body)> oracle_insert_pose;
 };
 
 struct FrameResult
@@ -88,6 +114,12 @@ struct FrameResult
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
   int features = 0;
   double rmse_px = 0.0;
+  double median_px = 0.0;   ///< VisualResult::median_px of the accepted solve
+  /// How far PnP moved the IMU's predicted pose when it replaced R and p in the seed, this frame;
+  /// -1 when PnP did not run or failed. A large jump on a coast frame goes straight into x_.
+  double pnp_jump_deg = -1.0;
+  double pnp_jump_m = -1.0;
+  int inliers = 0;          ///< VisualResult::inliers of the accepted solve
 };
 
 /// THE ESTIMATOR -- collect, bootstrap, then track. glasslio's LioEstimator, for a camera.
@@ -131,9 +163,20 @@ public:
     return map_->landmarks();
   }
   const LandmarkMap & map() const {return *map_;}
+  const WindowResult & lastWindow() const {return last_window_;}
+  int windowSolves() const {return window_solves_;}
+  int windowRefusals() const {return window_refusals_;}
+  int windowTriangulated() const {return window_triangulated_;}
+  /// Gravity, world frame -- fixed at the bootstrap, then re-estimated by the keyframe window.
+  const Eigen::Vector3d & gravity() const {return gravity_world_;}
 
 private:
   bool bootstrap();
+
+  /// Fold this frame into the map at body pose `T_world_body` -- or at the oracle's, when
+  /// EstimatorParams::oracle_insert_pose is set. The one place the map is grown from.
+  void insertFrame(
+    const FeatureTracker::Result & features, double t, const Eigen::Isometry3d & T_world_body);
 
   /// Pose from vision alone: PnP the current frame's observed landmarks against the metric
   /// map. This is what closes the bootstrap latency gap. The bootstrap runs on the worker
@@ -162,6 +205,12 @@ private:
     Eigen::Matrix<double, kNavDim, kNavDim>::Zero();
   Eigen::Vector3d gravity_world_{0.0, 0.0, -kGravity};
   std::unique_ptr<LandmarkMap> map_;
+  KeyframeWindow window_;
+  WindowResult last_window_;
+  int since_keyframe_ = 0;
+  int window_solves_ = 0;
+  int window_refusals_ = 0;
+  int window_triangulated_ = 0;
   double t_prev_ = 0.0;
   std::string last_failure_;
   int last_landmarks_ = 0;

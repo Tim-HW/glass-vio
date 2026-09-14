@@ -58,6 +58,7 @@ int main()
   std::uniform_real_distribution<double> u(-1.0, 1.0);
 
   double worst = 0.0;
+  double worst_landmark = 0.0;
   int cases = 0;
 
   for (int trial = 0; trial < 200; ++trial) {
@@ -112,11 +113,31 @@ int main()
     const double err = (J_analytic - J_numeric).cwiseAbs().maxCoeff();
     const double scale = std::max(1.0, J_numeric.cwiseAbs().maxCoeff());
     worst = std::max(worst, err / scale);
+
+    // --- The LANDMARK block, d r / d P_w, for the window's bundle adjustment. P_w is plain R^3,
+    // so the oracle steps it additively.
+    const Eigen::Matrix<double, 2, 3> Jl_analytic =
+      glassvio::reprojectionLandmarkJacobian(J_analytic);
+    Eigen::Matrix<double, 2, 3> Jl_numeric;
+    for (int c = 0; c < 3; ++c) {
+      Eigen::Vector3d d = Eigen::Vector3d::Zero();
+      d(c) = h;
+      Eigen::Vector3d Pi_p, Pc_p, Pi_m, Pc_m;
+      glassvio::landmarkInCamera(x, P_w + d, calib.T_cam_imu, params.min_depth, Pi_p, Pc_p);
+      glassvio::landmarkInCamera(x, P_w - d, calib.T_cam_imu, params.min_depth, Pi_m, Pc_m);
+      Jl_numeric.col(c) =
+        (glassvio::reprojectionResidual(Pc_p, observed, calib) -
+        glassvio::reprojectionResidual(Pc_m, observed, calib)) / (2.0 * h);
+    }
+    worst_landmark = std::max(
+      worst_landmark, (Jl_analytic - Jl_numeric).cwiseAbs().maxCoeff() /
+      std::max(1.0, Jl_numeric.cwiseAbs().maxCoeff()));
     ++cases;
   }
 
   assert(cases > 100 && "too few usable trials -- the generator is wrong, not the Jacobian");
   assert(worst < 1e-5 && "reprojection Jacobian disagrees with finite differences");
+  assert(worst_landmark < 1e-5 && "landmark Jacobian disagrees with finite differences");
 
   // --- The structural claim: a camera says NOTHING about velocity or the biases. Those nine
   // columns must be EXACTLY zero, not merely small -- the same claim pointToPlaneJacobianNav
@@ -153,8 +174,8 @@ int main()
   }
 
   std::printf(
-    "ok: %d trials, worst Jacobian error %.2e (finite differences through boxplus);\n"
-    "    vel/bg/ba columns exactly zero; cheirality rejected\n",
-    cases, worst);
+    "ok: %d trials, worst Jacobian error %.2e (finite differences through boxplus), landmark "
+    "block %.2e;\n    vel/bg/ba columns exactly zero; cheirality rejected\n",
+    cases, worst, worst_landmark);
   return 0;
 }

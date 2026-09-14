@@ -43,7 +43,8 @@ add_library(vio
   src/vio/vio_initializer.cpp
   src/vio/visual_registration.cpp
   src/vio/vio_estimator.cpp
-  src/vio/landmark_map.cpp)
+  src/vio/landmark_map.cpp
+  src/vio/keyframe_window.cpp)
 target_include_directories(vio PUBLIC include)
 ament_target_dependencies(vio
   rclcpp sensor_msgs geometry_msgs rosbag2_cpp cv_bridge OpenCV)
@@ -145,6 +146,56 @@ if(BUILD_TESTING)
     target_link_libraries(${t} ${OpenCV_LIBS} glass_core::glass_core)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
+
+  # The keyframe window's Schur solve, against a dense solve and glass_core's schurMarginalize.
+  # Links the pipeline library (the window lives there), so it takes the checks' dependencies.
+  add_executable(test_keyframe_window test/test_keyframe_window.cpp)
+  target_include_directories(test_keyframe_window PRIVATE include)
+  target_compile_options(test_keyframe_window PRIVATE -UNDEBUG)
+  ament_target_dependencies(test_keyframe_window
+    rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
+  target_link_libraries(test_keyframe_window vio)
+  add_test(NAME test_keyframe_window COMMAND test_keyframe_window)
+
+  add_executable(test_measurements test/test_measurements.cpp)
+  target_include_directories(test_measurements PRIVATE include)
+  target_compile_options(test_measurements PRIVATE -UNDEBUG)
+  ament_target_dependencies(test_measurements
+    rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
+  target_link_libraries(test_measurements glass_core::glass_core)
+  add_test(NAME test_measurements COMMAND test_measurements)
+
+  add_executable(test_measure_queue test/test_measure_queue.cpp)
+  target_include_directories(test_measure_queue PRIVATE include)
+  target_compile_options(test_measure_queue PRIVATE -UNDEBUG)
+  ament_target_dependencies(test_measure_queue sensor_msgs OpenCV)
+  add_test(NAME test_measure_queue COMMAND test_measure_queue)
+  set_tests_properties(test_measure_queue PROPERTIES TIMEOUT 30)
+
+  add_executable(test_estimator_regression test/test_estimator_regression.cpp)
+  target_include_directories(test_estimator_regression PRIVATE include)
+  target_compile_options(test_estimator_regression PRIVATE -UNDEBUG)
+  add_test(NAME test_estimator_regression COMMAND test_estimator_regression)
+  add_test(NAME test_download_bag COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_download_bag.sh)
+
+  option(GLASSVIO_EUROC_TEST "Run the EuRoC V1_01 dataset regression (download data first)" OFF)
+  if(GLASSVIO_EUROC_TEST)
+    add_test(NAME estimator_euroc COMMAND estimator_check
+      ${CMAKE_CURRENT_SOURCE_DIR}/data/vicon_room1/V1_01_easy/V1_01_easy_ros2
+      ${CMAKE_CURRENT_SOURCE_DIR}/config
+      ${CMAKE_CURRENT_BINARY_DIR}/estimator_euroc.csv
+      --gt=${CMAKE_CURRENT_SOURCE_DIR}/data/vicon_room1/V1_01_easy/gt/data.csv)
+    set_tests_properties(estimator_euroc PROPERTIES
+      LABELS dataset TIMEOUT 600 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
 endif()
 
 ament_package()
+
+# ament's linters register their tests INSIDE ament_package(), so a property on one has to come
+# after it -- set any earlier and the xmllint test does not exist yet, and CMake refuses to
+# configure at all.
+if(BUILD_TESTING AND TEST xmllint)
+  set_tests_properties(xmllint PROPERTIES
+    ENVIRONMENT "XML_CATALOG_FILES=${CMAKE_CURRENT_SOURCE_DIR}/test/schema/catalog.xml")
+endif()

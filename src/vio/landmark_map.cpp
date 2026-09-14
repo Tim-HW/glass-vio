@@ -16,6 +16,26 @@ void LandmarkMap::seed(const std::unordered_map<long, Eigen::Vector3d> & landmar
   }
 }
 
+void LandmarkMap::refine(const std::unordered_map<long, Eigen::Vector3d> & refined)
+{
+  for (const auto & lm : refined) {
+    const auto it = landmarks_.find(lm.first);
+    if (it != landmarks_.end()) {
+      it->second = lm.second;
+    }
+  }
+}
+
+void LandmarkMap::add(const std::unordered_map<long, Eigen::Vector3d> & fresh)
+{
+  for (const auto & lm : fresh) {
+    if (landmarks_.emplace(lm.first, lm.second).second) {
+      last_seen_[lm.first] = frame_;
+      pending_.erase(lm.first);   // its stale-pose observations have nothing left to do
+    }
+  }
+}
+
 void LandmarkMap::clear()
 {
   landmarks_.clear();
@@ -26,7 +46,7 @@ void LandmarkMap::clear()
   last_dropped_ = 0;
 }
 
-bool LandmarkMap::triangulate(
+LandmarkMap::TriResult LandmarkMap::triangulate(
   const Observation & a, const Observation & b, Eigen::Vector3d & out) const
 {
   // world -> cam, which is what the projection matrices need.
@@ -55,7 +75,7 @@ bool LandmarkMap::triangulate(
 
   const double w = X4.at<double>(3, 0);
   if (std::abs(w) < 1e-12) {
-    return false;   // at infinity: no baseline reached it
+    return TriResult::AtInfinity;   // no baseline reached it
   }
   const Eigen::Vector3d X(
     X4.at<double>(0, 0) / w, X4.at<double>(1, 0) / w, X4.at<double>(2, 0) / w);
@@ -64,7 +84,7 @@ bool LandmarkMap::triangulate(
   const double za = (T_ca_w * X).z();
   const double zb = (T_cb_w * X).z();
   if (za < p_.min_depth || zb < p_.min_depth || za > p_.max_depth || zb > p_.max_depth) {
-    return false;
+    return TriResult::Depth;
   }
 
   // Parallax ANGLE between the viewing rays. This is the test a pixel-flow threshold cannot
@@ -75,11 +95,11 @@ bool LandmarkMap::triangulate(
   const Eigen::Vector3d rb = (X - b.T_world_cam.translation()).normalized();
   const double ang = std::acos(std::clamp(ra.dot(rb), -1.0, 1.0)) * 180.0 / M_PI;
   if (ang < p_.min_parallax_deg) {
-    return false;   // WAIT for a wider baseline; do not guess a depth
+    return TriResult::Parallax;   // WAIT for a wider baseline; do not guess a depth
   }
 
   out = X;
-  return true;
+  return TriResult::Ok;
 }
 
 void LandmarkMap::insert(
@@ -88,6 +108,7 @@ void LandmarkMap::insert(
   ++frame_;
   last_triangulated_ = 0;
   last_dropped_ = 0;
+  stats_ = TriangulationStats();
 
   const Eigen::Isometry3d T_cam_w = T_world_cam.inverse();
 
@@ -116,6 +137,10 @@ void LandmarkMap::insert(
       continue;
     }
 
+    if (!p_.triangulate) {
+      continue;   // new landmarks come from the keyframe window instead
+    }
+
     // --- Not a landmark yet: accumulate observations until the baseline is worth using.
     auto & obs = pending_[id];
     obs.push_back({T_world_cam, px});
@@ -133,7 +158,12 @@ void LandmarkMap::insert(
     // adjacent frames instead would ask for depth from a 5 cm baseline and get noise -- which
     // is exactly the failure the min_parallax_deg gate exists to refuse.
     Eigen::Vector3d X;
-    if (triangulate(obs.front(), obs.back(), X)) {
+    ++stats_.attempts;
+    const TriResult tri = triangulate(obs.front(), obs.back(), X);
+    stats_.at_infinity += tri == TriResult::AtInfinity;
+    stats_.depth += tri == TriResult::Depth;
+    stats_.parallax += tri == TriResult::Parallax;
+    if (tri == TriResult::Ok) {
       landmarks_.emplace(id, X);
       last_seen_[id] = frame_;
       pending_.erase(id);
@@ -162,6 +192,7 @@ void LandmarkMap::insert(
     const auto seen = last_seen_.find(it->first);
     if (seen == last_seen_.end() || frame_ - seen->second > p_.max_unseen_frames * 4) {
       last_seen_.erase(it->first);
+      ++stats_.expired;
       it = pending_.erase(it);
     } else {
       ++it;

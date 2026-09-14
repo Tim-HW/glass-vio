@@ -40,7 +40,8 @@ struct MeasureGroup
   FeatureTracker::Result features;
   /// Samples covering [previous frame, this frame], in time order. The first is at or before
   /// the previous frame's stamp -- preintegration steps BETWEEN samples, so it needs that one
-  /// as the interval's left edge.
+  /// as the interval's left edge. The last sample is at or after the current frame;
+  /// integration clips these brackets to the exact image timestamps.
   std::vector<sensor_msgs::msg::Imu::ConstSharedPtr> imu;
 };
 

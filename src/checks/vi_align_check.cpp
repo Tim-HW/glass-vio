@@ -101,6 +101,13 @@ int main(int argc, char ** argv)
     r.sfm.pose.size(), r.gyro_bias.x(), r.gyro_bias.y(), r.gyro_bias.z(), r.bias_pairs,
     r.align_intervals);
   std::printf("[4] scale rel. uncertainty: %.3f (large = poorly excited)\n", r.scale_uncertainty);
+  const Eigen::Vector3d ba_gt = bag.gt.accelBias(bag.frames[window_start].t);
+  std::printf(
+    "[4] accel bias: [%+.3f %+.3f %+.3f] m/s^2, %s (marginal std %.3f)\n"
+    "                truth [%+.3f %+.3f %+.3f]\n",
+    r.accel_bias.x(), r.accel_bias.y(), r.accel_bias.z(),
+    r.accel_bias_estimated ? "ESTIMATED" : "not observable here, held at b0",
+    r.accel_bias_std, ba_gt.x(), ba_gt.y(), ba_gt.z());
   if (r.frames.empty()) {
     std::fprintf(stderr, "stage [4] failed outright\n");
     return 2;

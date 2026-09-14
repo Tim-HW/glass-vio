@@ -1,29 +1,15 @@
-// DETERMINISTIC OFFLINE DRIVE of the real VioEstimator -- the tool that splits "the node
-// fails" into a single yes/no.
-//
-// The node's bootstrap produces a reconstruction ~100x too small (landmark depths ~3 cm
-// against a ~metre scene), so every landmark is rejected and tracking never starts. But the
-// node is nondeterministic: a slow bootstrap on the worker drops frames, and which frames
-// drop depends on timing. That confounds every diagnosis.
-//
-// This removes ALL of it. It feeds VioEstimator::process() the exact frames the offline
-// dataset tracked, in order, with zero drops -- the same estimator object the node runs, with
-// none of the plumbing. Two outcomes, and they point in opposite directions:
-//
-//   * metric bootstrap here  -> the LOGIC is sound; the node's dropped frames corrupt the
-//                               SfM window. Fix the online frame handling.
-//   * tiny bootstrap here    -> bootstrap()'s own scale/window math is wrong, independent of
-//                               ROS. Fix the estimator.
-//
-// It reuses EurocDataset (which already tracked + undistorted the images) and only synthesises
-// the sensor_msgs the MeasureGroup wants -- so the feature and IMU data are byte-identical to
-// what the offline gates run on.
+// Deterministic offline drive of the real VioEstimator, with no frame drops.
+// Compares its trajectory with ground truth after one rigid alignment at bootstrap.
+// Quality thresholds target the default EuRoC V1_01_easy run; experiments may override
+// them or explicitly choose --report-only. Input and output failures always exit nonzero.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,6 +20,7 @@
 
 #include "glassvio/camera_calib.hpp"
 #include "glassvio/dataset.hpp"
+#include "glassvio/estimator_regression.hpp"
 #include "glassvio/types.hpp"
 #include "glassvio/vio_estimator.hpp"
 
@@ -43,14 +30,44 @@ static const char * kDefaultGt = "data/vicon_room1/V1_01_easy/gt/data.csv";
 namespace
 {
 
+// Round the fractional nanoseconds and carry across the seconds boundary.
+builtin_interfaces::msg::Time toStamp(double t)
+{
+  builtin_interfaces::msg::Time stamp;
+  const auto sec = static_cast<int64_t>(std::floor(t));
+  const auto ns = static_cast<int64_t>(std::llround((t - std::floor(t)) * 1e9));
+  stamp.sec = static_cast<int32_t>(sec + ns / 1000000000);
+  stamp.nanosec = static_cast<uint32_t>(ns % 1000000000);
+  return stamp;
+}
+
+// Every numeric option must consume its entire value; NaN must never disable a gate.
+double nonnegativeNumber(const std::string & value)
+{
+  std::size_t used = 0;
+  const double number = std::stod(value, &used);
+  if (used != value.size() || !std::isfinite(number) || number < 0.0) {
+    throw std::invalid_argument("expected a finite nonnegative number: " + value);
+  }
+  return number;
+}
+
+int nonnegativeInteger(const std::string & value)
+{
+  std::size_t used = 0;
+  const int number = std::stoi(value, &used);
+  if (used != value.size() || number < 0) {
+    throw std::invalid_argument("expected a nonnegative integer: " + value);
+  }
+  return number;
+}
+
 /// StampedImu -> the sensor_msgs the MeasureGroup carries. The estimator converts straight
 /// back at its boundary; this just satisfies the type.
 sensor_msgs::msg::Imu::ConstSharedPtr toMsg(const glassvio::StampedImu & s)
 {
   auto m = std::make_shared<sensor_msgs::msg::Imu>();
-  m->header.stamp.sec = static_cast<int32_t>(std::floor(s.t));
-  m->header.stamp.nanosec =
-    static_cast<uint32_t>((s.t - std::floor(s.t)) * 1e9);
+  m->header.stamp = toStamp(s.t);
   m->angular_velocity.x = s.gyro.x();
   m->angular_velocity.y = s.gyro.y();
   m->angular_velocity.z = s.gyro.z();
@@ -64,18 +81,162 @@ sensor_msgs::msg::Imu::ConstSharedPtr toMsg(const glassvio::StampedImu & s)
 
 int main(int argc, char ** argv)
 {
-  const std::string bag_path = (argc > 1) ? argv[1] : kDefaultBag;
-  const std::string calib_dir = (argc > 2) ? argv[2] : "config";
-  const std::string csv_path = (argc > 3) ? argv[3] : "/tmp/glassvio_run.csv";
+  // Positional [bag] [config] [out.csv], plus one optional flag for the accel-bias experiment
+  // (doc/08-sliding-window.md §5):
+  //   (none)       the node's defaults: b_a estimated in the alignment when observable
+  //   --no-est-ba  b_a pinned at 0 through the bootstrap -- the old behaviour, the baseline
+  //   --oracle-ba  b_a pinned at the dataset's TRUE value: what the scale would be if b_a were
+  //                known. An oracle, not a mode to ship -- it splits "b_a is the cause" from
+  //                "b_a is a bystander".
+  // and, independently, for where the scale goes during TRACKING:
+  //   --oracle-map    triangulate new landmarks from GROUND-TRUTH poses (carried into the
+  //                   estimator's world by T_align) instead of solved ones
+  //   --parallax=DEG  the map's minimum triangulation parallax (default 1.0 deg)
+  // and the camera-vs-IMU weighting (doc/08-sliding-window.md §6, Step 0):
+  //   --px-sigma=PX   pixel noise the camera rows are whitened by (default 1.0)
+  //   --imu-weight=W  scale on the IMU factor's information (default 1.0)
+  //   --imu-noise-x=K multiply the datasheet IMU noise densities (EuRoC's MAV vibrates)
+  // and Stage A, the keyframe window (doc/08-sliding-window.md §6):
+  //   --no-window     the per-frame tracker alone, as before Stage A
+  //   --anchor-gauge  VINS's anchor (position + yaw pinned, tilt soft) instead of ORB-SLAM3's
+  //   --kf-every=N    tracked frames between keyframes (default 4)
+  //   --window=K      keyframes in the window (default 10)
+  //   --window-tri    the window ALSO triangulates new landmarks, from its optimized poses (off
+  //                   by default: measured worse, doc/08 §6)
+  //   --no-map-tri    the map does not triangulate either -- new landmarks from the window alone
+  //   --gravity       re-estimate gravity's direction in the window (off by default: it halves
+  //                   the tilt but gains no position accuracy, doc/08 §6)
+  //   --gravity-sigma=DEG  the window's prior on gravity's direction (default 1 deg; 0 = none)
+  //   --inlier-fraction=F  refuse a tracker solve when fewer than F of its observations agree
+  //                   with it (default 0.5; 0 = accept every converged solve, as before)
+  //   --no-refused-insert  while coasting, do not insert a refused solve's frame at the
+  //                   coasted pose (starved frames still are)
+  //   --coast-on-pnp  a coast frame adopts the PnP-replaced seed, as before, instead of the IMU
+  //                   prediction
+  std::vector<std::string> pos;
+  std::string mode = "est-ba";
+  bool oracle_map = false;
+  double parallax_deg = 0.0;   // 0 = the node's default, for this and the two below
+  double px_sigma = 0.0;
+  double imu_weight = 0.0;
+  double imu_noise_x = 0.0;
+  bool no_window = false;
+  bool anchor_gauge = false;
+  int kf_every = 0;
+  int window_k = 0;
+  bool window_tri = false;
+  bool no_map_tri = false;
+  bool gravity = false;
+  double gravity_sigma = -1.0;   // < 0 = the default
+  double inlier_fraction = -1.0;   // < 0 = the default
+  bool no_refused_insert = false;
+  bool coast_on_pnp = false;
+  glassvio::EstimatorRegressionLimits limits;
+  bool report_only = false;
+  std::string gt_path;
+  try {
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "--help") {
+        std::printf(
+          "Usage: estimator_check [bag] [config] [out.csv] [options]\n"
+          "  --gt=PATH                  required for a nondefault bag\n"
+          "  --min-tracked-seconds=S     default 60, measured from bootstrap\n"
+          "  --max-median-error=M        default 0.75 metres\n"
+          "  --min-below-1m-seconds=S    default 30, continuous since bootstrap\n"
+          "  --report-only              print quality failures but exit 0\n"
+          "Experiment options (see doc/08-sliding-window.md):\n"
+          "  --no-est-ba --oracle-ba --oracle-map --parallax=DEG --px-sigma=PX\n"
+          "  --imu-weight=W --imu-noise-x=K --no-window --anchor-gauge\n"
+          "  --kf-every=N --window=K --window-tri --no-map-tri --gravity\n"
+          "  --gravity-sigma=DEG --inlier-fraction=F\n"
+          "Exit codes: 0 quality pass (or report-only), 1 quality failure, 2 input/I/O error.\n");
+        return 0;
+      } else if (a.rfind("--gt=", 0) == 0) {
+        gt_path = a.substr(5);
+        if (gt_path.empty()) {
+          throw std::invalid_argument("--gt requires a path");
+        }
+      } else if (a == "--report-only") {
+        report_only = true;
+      } else if (a.rfind("--min-tracked-seconds=", 0) == 0) {
+        limits.min_tracked_seconds = nonnegativeNumber(a.substr(22));
+      } else if (a.rfind("--max-median-error=", 0) == 0) {
+        limits.max_median_error = nonnegativeNumber(a.substr(19));
+      } else if (a.rfind("--min-below-1m-seconds=", 0) == 0) {
+        limits.min_below_1m_seconds = nonnegativeNumber(a.substr(23));
+      } else if (a == "--no-est-ba" || a == "--oracle-ba") {
+        mode = a.substr(2);
+      } else if (a == "--oracle-map") {
+        oracle_map = true;
+      } else if (a.rfind("--parallax=", 0) == 0) {
+        parallax_deg = nonnegativeNumber(a.substr(11));
+      } else if (a.rfind("--px-sigma=", 0) == 0) {
+        px_sigma = nonnegativeNumber(a.substr(11));
+      } else if (a.rfind("--imu-weight=", 0) == 0) {
+        imu_weight = nonnegativeNumber(a.substr(13));
+      } else if (a.rfind("--imu-noise-x=", 0) == 0) {
+        imu_noise_x = nonnegativeNumber(a.substr(14));
+      } else if (a == "--no-window") {
+        no_window = true;
+      } else if (a == "--anchor-gauge") {
+        anchor_gauge = true;
+      } else if (a.rfind("--kf-every=", 0) == 0) {
+        kf_every = nonnegativeInteger(a.substr(11));
+      } else if (a.rfind("--window=", 0) == 0) {
+        window_k = nonnegativeInteger(a.substr(9));
+      } else if (a == "--window-tri") {
+        window_tri = true;
+      } else if (a == "--no-map-tri") {
+        no_map_tri = true;
+      } else if (a == "--gravity") {
+        gravity = true;
+      } else if (a.rfind("--gravity-sigma=", 0) == 0) {
+        gravity_sigma = nonnegativeNumber(a.substr(16));
+      } else if (a.rfind("--inlier-fraction=", 0) == 0) {
+        inlier_fraction = nonnegativeNumber(a.substr(18));
+      } else if (a == "--no-refused-insert") {
+        no_refused_insert = true;
+      } else if (a == "--coast-on-pnp") {
+        coast_on_pnp = true;
+      } else if (!a.empty() && a.front() == '-') {
+        throw std::invalid_argument("unknown option: " + a);
+      } else {
+        pos.push_back(a);
+      }
+    }
+    if (pos.size() > 3) {
+      throw std::invalid_argument("expected at most [bag] [config] [out.csv]");
+    }
+    if (gt_path.empty()) {
+      if (!pos.empty() && pos[0] != kDefaultBag) {
+        throw std::invalid_argument("a nondefault bag requires --gt=PATH");
+      }
+      gt_path = kDefaultGt;
+    }
+  } catch (const std::exception & e) {
+    std::fprintf(stderr, "invalid arguments: %s\n", e.what());
+    return 2;
+  }
+  const std::string bag_path = pos.size() > 0 ? pos[0] : kDefaultBag;
+  const std::string calib_dir = pos.size() > 1 ? pos[1] : "config";
+  const std::string csv_path = pos.size() > 2 ? pos[2] : "/tmp/glassvio_run.csv";
 
   glassvio::CameraCalib calib;
   glassvio::EurocDataset bag;
   try {
     calib = glassvio::loadEurocCalib(calib_dir);
-    bag = glassvio::EurocDataset::load(bag_path, kDefaultGt, calib, {true, -1});
+    bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, {true, -1});
   } catch (const std::exception & e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;
+  }
+  if (imu_noise_x > 0.0) {
+    calib.gyro_noise *= imu_noise_x;
+    calib.accel_noise *= imu_noise_x;
+    std::printf(
+      "IMU noise densities x%.1f: gyro %.3g rad/s/rtHz, accel %.3g m/s^2/rtHz\n",
+      imu_noise_x, calib.gyro_noise, calib.accel_noise);
   }
   if (bag.frames.size() < 100 || bag.imu.empty() || bag.gt.empty()) {
     std::fprintf(stderr, "need image, imu and ground-truth streams\n");
@@ -85,20 +246,80 @@ int main(int argc, char ** argv)
     "deterministic drive: %zu frames, %zu imu, %zu gt\n",
     bag.frames.size(), bag.imu.size(), bag.gt.size());
 
-  glassvio::EstimatorParams ep;   // exactly the node's defaults
-  glassvio::VioEstimator est(calib, ep);
+  glassvio::EstimatorParams ep;   // exactly the node's defaults, unless a mode flag says otherwise
+  if (mode != "est-ba") {
+    ep.init.estimate_accel_bias = false;
+  }
+  if (mode == "oracle-ba") {
+    // EuRoC's b_a is near-constant over the sequence; take it where the bootstrap will fire.
+    const std::size_t kb = std::min<std::size_t>(ep.bootstrap_frames, bag.frames.size() - 1);
+    ep.init.accel_bias = bag.gt.accelBias(bag.frames[kb].t);
+  }
+  if (parallax_deg > 0.0) {
+    ep.map.min_parallax_deg = parallax_deg;
+  }
+  if (px_sigma > 0.0) {
+    ep.visual.reproj.sigma_px = px_sigma;
+  }
+  if (imu_weight > 0.0) {
+    ep.visual.imu_prior_weight = imu_weight;
+  }
+  ep.window.enabled = !no_window;
+  ep.window.anchor_full = !anchor_gauge;
+  if (kf_every > 0) {
+    ep.window.keyframe_every = kf_every;
+  }
+  if (window_k > 0) {
+    ep.window.max_keyframes = window_k;
+  }
+  ep.window.triangulate = window_tri;
+  ep.map.triangulate = !no_map_tri;
+  ep.window.estimate_gravity = gravity;
+  if (gravity_sigma >= 0.0) {
+    ep.window.gravity_sigma_deg = gravity_sigma;
+  }
+  if (inlier_fraction >= 0.0) {
+    ep.visual.min_inlier_fraction = inlier_fraction;
+  }
+  ep.coast_insert_refused = !no_refused_insert;
+  ep.coast_on_pnp = coast_on_pnp;
+  std::printf(
+    "tracker solves refused below an inlier fraction of %.2f\n", ep.visual.min_inlier_fraction);
+  std::printf(
+    "gravity direction: %s (prior %.2f deg)\n",
+    ep.window.enabled && ep.window.estimate_gravity ? "re-estimated by the window" : "frozen",
+    ep.window.gravity_sigma_deg);
+  std::printf(
+    "new landmarks triangulated by: window %s, map %s\n",
+    ep.window.enabled && ep.window.triangulate ? "yes" : "no", ep.map.triangulate ? "yes" : "no");
+  std::printf(
+    "window: %s, %d keyframes, one every %d frames, anchor %s\n",
+    ep.window.enabled ? "ON" : "off", ep.window.max_keyframes, ep.window.keyframe_every,
+    ep.window.anchor_full ? "fully fixed (ORB-SLAM3)" : "gauge only (VINS)");
+  std::printf(
+    "mode: b_a %s, map from %s, min parallax %.1f deg, sigma_px %.1f, imu weight %.1f\n",
+    mode.c_str(), oracle_map ? "GROUND-TRUTH poses" : "solved poses", ep.map.min_parallax_deg,
+    ep.visual.reproj.sigma_px, ep.visual.imu_prior_weight);
 
   const auto & imu = bag.imu.samples();
   std::size_t imu_cursor = 0;
-  double t_prev = imu.empty() ? 0.0 : imu.front().t - 1.0;
 
   // Per-frame CSV, so a run can be plotted rather than squinted at. One row per frame.
   std::ofstream csv(csv_path);
+  if (!csv) {
+    std::fprintf(stderr, "cannot open output CSV: %s\n", csv_path.c_str());
+    return 2;
+  }
   csv <<
     "t,stage,feats,map,pending,rmse_px,"
     "pos_err,vel_err,"
     "px,py,pz,gx,gy,gz,vx,vy,vz,gvx,gvy,gvz,"
-    "bgx,bgy,bgz,gbgx,gbgy,gbgz,bax,bay,baz,gbax,gbay,gbaz\n";
+    "bgx,bgy,bgz,gbgx,gbgy,gbgz,bax,bay,baz,gbax,gbay,gbaz,"
+    "win_lm,win_cost0,win_cost1,win_iter,win_shift,win_tri,"
+    "tri_try,tri_inf,tri_depth,tri_par,pend_exp,grav_err_deg,med_px,inliers,"
+    "win_c0_prior,win_c0_imu,win_c0_vis,"
+    "win_kfs,imu_worst_k,imu_worst_dt,imu_worst_rot_deg,imu_worst_vel,imu_worst_pos,"
+    "rot_err_deg,pnp_jump_deg,pnp_jump_m\n";
   csv.setf(std::ios::fixed);
   csv.precision(6);
 
@@ -107,7 +328,12 @@ int main(int argc, char ** argv)
   int lost_at = -1;
   double boot_depth_median = 0.0;
   std::size_t boot_landmarks = 0;
-  std::vector<double> errors;
+  std::vector<glassvio::EstimatorRegressionSample> regression_samples;
+  double bootstrap_time = std::numeric_limits<double>::quiet_NaN();
+  bool finite_state = true;
+  std::vector<double> speed_ratios;
+  double first_over_1m = -1.0;   // the honest survival score, see the verdict
+  double last_grav_err = 0.0;
 
   // ALIGNMENT AT BOOTSTRAP, so the error is honest. The estimator DEFINES its own world:
   // origin at the first body pose, +Z along gravity, yaw arbitrary. That frame is NOT the
@@ -118,26 +344,52 @@ int main(int argc, char ** argv)
   Eigen::Isometry3d T_align = Eigen::Isometry3d::Identity();
   const double t0 = bag.frames.front().t;
 
+  // --oracle-map: ground truth, carried into the estimator's world through T_align. Only after
+  // the bootstrap -- before it there is no T_align, and no map to grow.
+  if (oracle_map) {
+    ep.oracle_insert_pose = [&](double t, Eigen::Isometry3d & T_world_body) {
+        if (bootstrapped_at < 0) {
+          return false;
+        }
+        T_world_body = T_align.inverse() * bag.gt.at(t);
+        return true;
+      };
+  }
+  glassvio::VioEstimator est(calib, ep);
+
   for (std::size_t k = 0; k < bag.frames.size(); ++k) {
     const auto & f = bag.frames[k];
 
     glassvio::MeasureGroup g;
-    g.header.stamp.sec = static_cast<int32_t>(std::floor(f.t));
-    g.header.stamp.nanosec = static_cast<uint32_t>((f.t - std::floor(f.t)) * 1e9);
+    g.header.stamp = toStamp(f.t);
     for (const auto & entry : f.by_id) {
       g.features.ids.push_back(entry.first);
       g.features.points.push_back(entry.second);
     }
-    // Every IMU sample in (t_prev, f.t], in order, exactly once -- an unbroken chain, which is
-    // precisely what the node's dropped frames destroy.
-    for (; imu_cursor < imu.size() && imu[imu_cursor].t <= f.t; ++imu_cursor) {
-      if (imu[imu_cursor].t > t_prev) {
-        g.imu.push_back(toMsg(imu[imu_cursor]));
-      }
+    // Feed an unbroken IMU chain including the first sample at/after the image.
+    // The estimator retains that endpoint for the next interval's interpolation.
+    while (imu_cursor < imu.size() && imu[imu_cursor].t < f.t) {
+      g.imu.push_back(toMsg(imu[imu_cursor++]));
     }
-    t_prev = f.t;
+    if (imu_cursor < imu.size() && (imu_cursor == 0 || imu[imu_cursor - 1].t < f.t)) {
+      g.imu.push_back(toMsg(imu[imu_cursor++]));
+    }
 
     const glassvio::FrameResult r = est.process(g);
+
+    const bool tracking_now = r.stage == glassvio::FrameResult::Stage::Bootstrapped ||
+      r.stage == glassvio::FrameResult::Stage::Tracking;
+    // The ground truth ENDING while the estimator still tracks is not an input error: EuRoC's
+    // images outlast its ground truth, so any run that survives the sequence gets here. Scoring
+    // stops where the truth does. A tracked frame BEFORE the truth begins still is an error.
+    if (tracking_now && f.t > bag.gt.t_end()) {
+      std::printf("\nground truth ends at t = %.1f s; scoring stops there\n", f.t - t0);
+      break;
+    }
+    if (tracking_now && f.t < bag.gt.t_begin()) {
+      std::fprintf(stderr, "ground truth does not cover estimated frame at %.9f\n", f.t);
+      return 2;
+    }
 
     // The estimator body pose in ITS world, this frame.
     Eigen::Isometry3d T_wb = Eigen::Isometry3d::Identity();
@@ -146,6 +398,7 @@ int main(int argc, char ** argv)
 
     if (r.stage == glassvio::FrameResult::Stage::Bootstrapped) {
       bootstrapped_at = static_cast<int>(k);
+      bootstrap_time = f.t;
       boot_landmarks = est.landmarks().size();
       // The one rigid transform between est-world and gt-world, fixed here forever.
       T_align = bag.gt.at(f.t) * T_wb.inverse();
@@ -164,6 +417,17 @@ int main(int argc, char ** argv)
         bootstrapped_at, f.t - t0, boot_landmarks, boot_depth_median, est.state().v.norm(),
         est.state().bg.x(), est.state().bg.y(), est.state().bg.z(),
         bag.gt.gyroBias(f.t).x(), bag.gt.gyroBias(f.t).y(), bag.gt.gyroBias(f.t).z());
+
+      // Gravity TILT at bootstrap. The estimator defines +Z along ITS gravity, so a roll/pitch
+      // error lands in T_align as a rotation that moves Z; yaw is free and does not.
+      const Eigen::Vector3d gba = bag.gt.accelBias(f.t);
+      const double tilt_deg = std::acos(std::clamp(
+            (T_align.linear() * Eigen::Vector3d::UnitZ()).z(), -1.0, 1.0)) * 180.0 / M_PI;
+      std::printf(
+        "  ba = [%+.3f %+.3f %+.3f]  (truth [%+.3f %+.3f %+.3f])\n"
+        "  gravity tilt %.2f deg, |v|/|v_gt| = %.3f\n",
+        est.state().ba.x(), est.state().ba.y(), est.state().ba.z(), gba.x(), gba.y(), gba.z(),
+        tilt_deg, est.state().v.norm() / std::max(bag.gt.velocity(f.t).norm(), 1e-9));
     } else if (r.stage == glassvio::FrameResult::Stage::Lost) {
       if (lost_at < 0 && bootstrapped_at >= 0) {
         lost_at = static_cast<int>(k);
@@ -182,12 +446,35 @@ int main(int argc, char ** argv)
       const Eigen::Vector3d gv = bag.gt.velocity(f.t);
       const double pos_err = (p - gp).norm();
       const double vel_err = (v - gv).norm();
+      if (first_over_1m < 0.0 && pos_err > 1.0) {
+        first_over_1m = f.t - t0;
+      }
+      // Gravity's DIRECTION against the truth, in the estimator's own world: the true "down",
+      // carried in by T_align. At the bootstrap this is the tilt printed above.
+      const double grav_err = std::acos(
+        std::clamp(
+          est.gravity().normalized().dot(
+            T_align.linear().transpose() * Eigen::Vector3d(0.0, 0.0, -1.0)), -1.0, 1.0)) *
+        180.0 / M_PI;
+      last_grav_err = grav_err;
+      // The tracker's ATTITUDE against the truth, through the same T_align -- the bootstrap tilt
+      // is its floor. A step here is the pose itself turning, whatever the pixels say.
+      const double rot_err = Eigen::AngleAxisd(
+        (T_align.linear() * est.state().R.matrix()).transpose() *
+        bag.gt.at(f.t).linear()).angle() * 180.0 / M_PI;
       if (r.stage == glassvio::FrameResult::Stage::Tracking) {
         ++tracked;
-        errors.push_back(pos_err);
+        regression_samples.push_back({f.t, pos_err});
+        // THE SCALE, read off the speed. Skip near-hover frames, where the ratio is noise.
+        if (gv.norm() > 0.3) {
+          speed_ratios.push_back(v.norm() / gv.norm());
+        }
       }
 
       const auto & s = est.state();
+      finite_state = finite_state && s.R.matrix().allFinite() && s.p.allFinite() &&
+        s.v.allFinite() && s.bg.allFinite() && s.ba.allFinite() &&
+        std::isfinite(pos_err) && std::isfinite(vel_err) && std::isfinite(grav_err);
       const Eigen::Vector3d gbg = bag.gt.gyroBias(f.t);
       const Eigen::Vector3d gba = bag.gt.accelBias(f.t);
       csv << (f.t - t0) << ","
@@ -201,42 +488,72 @@ int main(int argc, char ** argv)
           << s.bg.x() << "," << s.bg.y() << "," << s.bg.z() << ","
           << gbg.x() << "," << gbg.y() << "," << gbg.z() << ","
           << s.ba.x() << "," << s.ba.y() << "," << s.ba.z() << ","
-          << gba.x() << "," << gba.y() << "," << gba.z() << "\n";
+          << gba.x() << "," << gba.y() << "," << gba.z() << ","
+        // The LAST window solve (it repeats between keyframes): how it went, and how far it
+        // moved the state the tracker resumes from.
+          << est.lastWindow().landmarks << "," << est.lastWindow().cost_before << ","
+          << est.lastWindow().cost_after << "," << est.lastWindow().iterations << ","
+          << est.lastWindow().newest_shift_m << "," << est.lastWindow().triangulated << ","
+        // Why the map's pending tracks did NOT mature this frame (LandmarkMap::lastStats).
+          << est.map().lastStats().attempts << "," << est.map().lastStats().at_infinity << ","
+          << est.map().lastStats().depth << "," << est.map().lastStats().parallax << ","
+          << est.map().lastStats().expired << "," << grav_err << ","
+          << r.median_px << "," << r.inliers << ","
+          << est.lastWindow().cost_before_prior << "," << est.lastWindow().cost_before_imu << ","
+          << est.lastWindow().cost_before_vis << "," << est.lastWindow().keyframes << ","
+          << est.lastWindow().worst_imu_k << "," << est.lastWindow().worst_imu_dt << ","
+          << est.lastWindow().worst_imu_rot_deg << "," << est.lastWindow().worst_imu_vel << ","
+          << est.lastWindow().worst_imu_pos << "," << rot_err << "," << r.pnp_jump_deg << ","
+          << r.pnp_jump_m << "\n";
+    }
+    if (r.stage == glassvio::FrameResult::Stage::Lost && bootstrapped_at >= 0) {
+      break;
     }
   }
 
   csv.close();
+  if (!csv) {
+    std::fprintf(stderr, "failed to write output CSV: %s\n", csv_path.c_str());
+    return 2;
+  }
   std::printf("\nper-frame CSV -> %s\n\n=== VERDICT ===\n", csv_path.c_str());
-  if (bootstrapped_at < 0) {
-    std::printf("never bootstrapped -- stage [2]/[3]/[4] never cleared offline either\n");
-    return 1;
+  auto verdict = glassvio::estimatorRegression(bootstrap_time, regression_samples, limits);
+  if (!std::isfinite(boot_depth_median) || boot_depth_median < 0.3) {
+    verdict.failures.push_back("bootstrap median landmark depth is below 0.3 m or nonfinite");
   }
-
-  const double fps = (bag.frames.size() - 1) /
-    (bag.frames.back().t - bag.frames.front().t);
+  if (!finite_state) {
+    verdict.failures.push_back("a tracked state or ground-truth error is nonfinite");
+  }
   std::printf(
-    "bootstrapped, then tracked %d frames (%.2f s) before %s\n",
-    tracked, tracked / fps,
-    lost_at < 0 ? "the sequence ended" : "losing the scene");
-
-  if (boot_depth_median < 0.3) {
+    "bootstrapped at frame %d; tracked %d frames (%.2f s) before %s\n"
+    "bootstrap median landmark depth: %.3f m (minimum 0.300 m)\n"
+    "tracked duration: %.2f s (minimum %.2f s)\n"
+    "median position error vs ground truth: %.3f m (maximum %.3f m)\n"
+    "continuous duration at or below 1 m: %.2f s (minimum %.2f s)\n",
+    bootstrapped_at, tracked, verdict.tracked_seconds,
+    lost_at < 0 ? "the sequence ended" : "losing the scene",
+    boot_depth_median, verdict.tracked_seconds, limits.min_tracked_seconds,
+    verdict.median_error, limits.max_median_error,
+    verdict.below_1m_seconds, limits.min_below_1m_seconds);
+  if (first_over_1m < 0.0) {
+    std::printf("no position error above 1 m was observed\n");
+  } else {
+    std::printf("position error first passed 1 m at t = %.1f s\n", first_over_1m);
+  }
+  std::printf("gravity direction error at the last tracked frame: %.2f deg\n", last_grav_err);
+  if (!speed_ratios.empty()) {
+    std::sort(speed_ratios.begin(), speed_ratios.end());
     std::printf(
-      "\nLANDMARKS ARE %.0fx TOO CLOSE (median depth %.3f m in a metre-scale room).\n"
-      "The bug reproduces DETERMINISTICALLY here, with no dropped frames. So it is NOT the\n"
-      "online plumbing -- bootstrap()'s own scale/window selection is wrong. Fix the\n"
-      "estimator, not the node.\n",
-      3.0 / std::max(boot_depth_median, 1e-3), boot_depth_median);
-    return 1;
+      "median |v|/|v_gt| while tracking: %.3f  (1.0 = metric scale held)\n",
+      speed_ratios[speed_ratios.size() / 2]);
   }
-
   std::printf(
-    "\nlandmarks at a sane %.2f m median depth, and it tracked %.2f s.\n"
-    "The bootstrap LOGIC is sound: the node's failure is its ONLINE frame handling\n"
-    "(dropped frames corrupting the SfM window), not the estimator.\n",
-    boot_depth_median, tracked / fps);
-  if (!errors.empty()) {
-    std::sort(errors.begin(), errors.end());
-    std::printf("median position error vs ground truth: %.3f m\n", errors[errors.size() / 2]);
+    "keyframe window: %d solves, %d refused, %d landmarks triangulated\n", est.windowSolves(),
+    est.windowRefusals(), est.windowTriangulated());
+  for (const auto & failure : verdict.failures) {
+    std::printf("FAIL: %s\n", failure.c_str());
   }
-  return 0;
+  std::printf("REGRESSION %s%s\n", verdict.failures.empty() ? "PASS" : "FAIL",
+    report_only ? " (report-only: quality does not affect exit status)" : "");
+  return report_only || verdict.failures.empty() ? 0 : 1;
 }

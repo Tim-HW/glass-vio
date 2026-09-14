@@ -2,12 +2,12 @@
 #
 # Fetch the EuRoC sequence the course's Labs are scored against, into data/.
 #
-#   ./scripts/download_bag.sh              download, convert to ROS 2, verify
+#   ./scripts/download_bag.sh              download sensors + ground truth, convert, verify
 #   ./scripts/download_bag.sh --force      redo even if the converted bag is here
 #   ./scripts/download_bag.sh --keep-ros1  keep the original ROS 1 .bag afterwards
 #
-# ~1.2 GB downloaded, and about the same again converted, which is why data/ is
-# gitignored rather than committed.
+# ~2.3 GB downloaded (ROS 1 bag + ASL ZIP for ground truth), ~2.1 GB converted.
+# The ZIP is removed after extracting gt/data.csv. data/ is gitignored.
 #
 # Source: Burri et al. (2016), "The EuRoC micro aerial vehicle datasets",
 #         IJRR 35(10). https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets
@@ -23,13 +23,15 @@
 # node reads message stamps throughout and never asks the ROS clock for anything, so the
 # absence of /clock in the converted bag costs nothing.
 #
-# Safe to re-run: if the converted bag is present and carries both topics, this does nothing.
+# Safe to re-run: completed downloads are reused and partial downloads are resumed.
 
 set -euo pipefail
 
-readonly URL="http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.bag"
+readonly BASE_URL="http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy"
 readonly ROS1_BAG="V1_01_easy.bag"
 readonly ROS2_DIR="V1_01_easy_ros2"
+readonly ASL_ZIP="V1_01_easy.zip"
+readonly GT_CSV="gt/data.csv"
 
 # The two topics the node actually subscribes to. /imu0 is the ADIS16448 the calibration in
 # config/ describes -- the bag also carries the flight controller's IMU, a DIFFERENT sensor
@@ -53,7 +55,6 @@ for arg in "$@"; do
 done
 
 log()  { printf '\033[1;34m[bag]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[bag]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[bag]\033[0m %s\n' "$*" >&2; exit 1; }
 
 mkdir -p "$DEST_DIR"
@@ -70,31 +71,56 @@ verify() {
   grep -q -- "$TOPIC_IMU" "${ROS2_DIR}/metadata.yaml" || return 1
 }
 
-if [[ "$FORCE" -eq 0 ]] && verify; then
-  log "converted bag already present and carries both topics. Nothing to do."
-  log "run:  ./run_euroc.sh"
-  exit 0
-fi
-
 # --- fetch -----------------------------------------------------------------
 # curl or wget, whichever exists. Both RESUME a partial transfer, which matters for a
 # gigabyte on a flaky connection: an interrupted run is fixed by re-running this script,
 # not by starting over.
-if [[ "$FORCE" -eq 1 || ! -f "$ROS1_BAG" ]]; then
+fetch() {
+  local file="$1"
+  [[ "$FORCE" -eq 0 && -f "$file" ]] && return 0
+  # Never mistake an interrupted transfer for a completed download. --force starts fresh.
+  [[ "$FORCE" -eq 0 ]] || rm -f "${file}.part"
+  log "downloading ${file} from ETH Zurich (resumable -- re-run if interrupted)..."
   if command -v curl >/dev/null 2>&1; then
-    log "downloading ~1.2 GB from ETH Zurich (resumable -- re-run if interrupted)..."
-    curl -L --fail --progress-bar -C - -o "$ROS1_BAG" "$URL" \
+    curl -L --fail --progress-bar --connect-timeout 30 --retry 3 \
+      -C - -o "${file}.part" "${BASE_URL}/${file}" \
       || die "download failed. Re-run to resume from where it stopped."
   elif command -v wget >/dev/null 2>&1; then
-    log "downloading ~1.2 GB from ETH Zurich (resumable -- re-run if interrupted)..."
-    wget --continue --show-progress -O "$ROS1_BAG" "$URL" \
+    wget --continue --show-progress --timeout=30 --tries=3 \
+      -O "${file}.part" "${BASE_URL}/${file}" \
       || die "download failed. Re-run to resume from where it stopped."
   else
     die "need either curl or wget."
   fi
-else
-  log "ROS 1 bag already downloaded; converting it."
+  mv "${file}.part" "$file"
+}
+
+# The ROS bag does not contain the batch estimate's velocity and bias states. The
+# scoring harness needs the 17-column ASL CSV, not the bag's Vicon pose topic.
+verify_gt() {
+  [[ -s "$1" ]] || return 1
+  awk -F, '!/^#/ && NF {if (NF != 17) bad=1; rows++}
+    END {exit (bad || !rows)}' "$1"
+}
+
+if [[ "$FORCE" -eq 1 ]] || ! verify_gt "$GT_CSV"; then
+  command -v unzip >/dev/null 2>&1 || die "need 'unzip' to extract ground truth."
+  fetch "$ASL_ZIP"
+  mkdir -p gt
+  unzip -p "$ASL_ZIP" mav0/state_groundtruth_estimate0/data.csv > "${GT_CSV}.part" \
+    || die "ground-truth extraction failed. Re-run with --force."
+  verify_gt "${GT_CSV}.part" || die "ground-truth CSV is invalid. Re-run with --force."
+  mv "${GT_CSV}.part" "$GT_CSV"
+  rm -f "$ASL_ZIP"
 fi
+
+if [[ "$FORCE" -eq 0 ]] && verify; then
+  log "converted bag and ground truth are ready."
+  log "run:  ./run_euroc.sh"
+  exit 0
+fi
+
+fetch "$ROS1_BAG"
 
 # --- convert ---------------------------------------------------------------
 command -v rosbags-convert >/dev/null 2>&1 || die \

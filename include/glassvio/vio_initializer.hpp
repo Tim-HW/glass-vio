@@ -60,6 +60,17 @@ struct InitializerParams
   /// 3x-biased-scale window through (est velocity 30% of truth, drift); 0.06 admits only
   /// genuinely well-excited windows.
   double max_scale_uncertainty = 0.06;
+
+  /// [4] The accel bias the alignment INTEGRATES at, m/s^2, body frame. Zero unless the caller
+  /// knows better -- estimator_check's --oracle-ba puts the dataset's true bias here, to ask
+  /// what the scale would be if b_a were known.
+  Eigen::Vector3d accel_bias = Eigen::Vector3d::Zero();
+  /// Solve for b_a as three more unknowns of the SAME linear system (it enters linearly through
+  /// preintegration's dp_dba/dv_dba). Accepted only when its marginal std is below
+  /// max_accel_bias_std -- b_a is separable from gravity only if the window ROTATES -- and
+  /// otherwise the solve falls back to `accel_bias`.
+  bool estimate_accel_bias = true;
+  double max_accel_bias_std = 0.1;
 };
 
 /// What the bootstrap produced. Everything spatial is in the SFM FRAME -- the base camera --
@@ -90,6 +101,12 @@ struct InitResult
   /// s unreliable even when positive. The sufficient half of scale_observable, and
   /// dimensionless so it needs no per-dataset threshold.
   double scale_uncertainty = 0.0;
+  /// [4] m/s^2, body frame. The estimate when `accel_bias_estimated`, otherwise the bias the
+  /// alignment integrated at (InitializerParams::accel_bias). Either way, what to seed b_a with.
+  Eigen::Vector3d accel_bias = Eigen::Vector3d::Zero();
+  bool accel_bias_estimated = false;
+  /// Largest per-axis marginal std of the b_a estimate -- reported even when it failed the gate.
+  double accel_bias_std = 0.0;
   /// [4] The frames the alignment solved for, sorted, and their velocities in the SfM frame.
   std::vector<int> frames;
   std::vector<Eigen::Vector3d> velocity_sfm;

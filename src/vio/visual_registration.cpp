@@ -1,6 +1,8 @@
 #include "glassvio/visual_registration.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "glass_core/gauss_newton.hpp"
 
@@ -132,6 +134,41 @@ VisualResult solveFrame(
       result.converged = true;
       break;
     }
+  }
+
+  // --- The fit at the FINAL state, robustly: how much of the view agrees with this pose. The
+  // median and the inlier count, not the rmse -- see VisualResult.
+  std::vector<double> err_px;
+  for (const auto & entry : landmarks) {
+    const auto obs = observations.find(entry.first);
+    if (obs == observations.end()) {
+      continue;
+    }
+    Eigen::Vector3d P_i, P_c;
+    if (!landmarkInCamera(x, entry.second, calib.T_cam_imu, params.reproj.min_depth, P_i, P_c)) {
+      continue;
+    }
+    err_px.push_back(
+      reprojectionResidual(P_c, Eigen::Vector2d(obs->second.x, obs->second.y), calib).norm());
+  }
+  if (!err_px.empty()) {
+    result.inliers = static_cast<int>(std::count_if(
+        err_px.begin(), err_px.end(), [&](double e) {return e <= params.inlier_px;}));
+    std::nth_element(err_px.begin(), err_px.begin() + err_px.size() / 2, err_px.end());
+    result.median_px = err_px[err_px.size() / 2];
+  }
+
+  // THE CONSISTENCY GATE -- ORB-SLAM3's "too few inliers after pose optimization: lost". A solve
+  // can converge with most of the view disagreeing (a bad seed, a burst of mistracks), and
+  // accepting it is worse than refusing it: the map is then pruned against the wrong pose. On
+  // EuRoC V1_01 one such solve at 87.6 s (1 inlier of 94) cut the map from 143 landmarks to 60 in
+  // a single frame, and the run never recovered. Refused, the caller coasts on the IMU instead.
+  if (params.min_inlier_fraction > 0.0 &&
+    static_cast<double>(result.inliers) <
+    params.min_inlier_fraction * static_cast<double>(err_px.size()))
+  {
+    result.valid = false;
+    result.refused = true;
   }
 
   result.state = x;
