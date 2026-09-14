@@ -219,6 +219,12 @@ void VioEstimator::insertFrame(
     T = T_world_body;   // the oracle declined (e.g. no alignment yet): use the solved pose
   }
   map_->insert(features, T * calib_.T_cam_imu.inverse());
+  // A landmark dropped as an outlier may come back under the same KLT id, re-triangulated from
+  // the recent poses at a new position. The window's older views are of the OLD one: measured,
+  // they are what blew up the first window solve after a coast (doc/08 §6).
+  if (p_.window.forget_outliers) {
+    window_.forget(map_->lastOutliers());
+  }
 }
 
 // =================================================================================

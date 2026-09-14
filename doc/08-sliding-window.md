@@ -26,10 +26,10 @@ the offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
 | metric | per-frame tracker alone | **today's default** (§6) |
 |---|---|---|
 | bootstrap landmark depth | 1.62 m (true room scale) | 1.62 m |
-| velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.78 | **~1.02** |
+| velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.78 | **~1.00** |
 | tracked | ~29 s | **132 s** — to the end of the ground truth |
-| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.54 m** (over 132 s) |
-| error first passed 1 m | — | **130.5 s** (fragile near 88 s: §6) |
+| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.33 m** (over 132 s) |
+| error first passed 1 m | — | **never** — at every tracker gate from 0 to 0.7 (§6) |
 
 §2–§5 are the story of the left column — how its drift was traced. §6 is the right column.
 
@@ -319,22 +319,53 @@ and writing a 6× velocity. The camera could not object — a pose that fits eve
 velocity. Now a coast adopts the IMU's own prediction, and PnP stays the Gauss-Newton seed, which is
 its job (`EstimatorParams::coast_on_pnp`).
 
+Measured before the fix that follows (`--no-forget --window-outlier-px=0` reproduces it):
+
 | `estimator_check` | first >1 m | median err |
 |---|---|---|
 | no gate (`--inlier-fraction=0`, as Stage A left it) | 89.0 s | 0.456 m |
 | gate 0.5, coasting on PnP (`--coast-on-pnp`) | never — but lost at 90 s | 0.449 m |
-| **gate 0.5, coasting on the IMU (default)** | **130.5 s** — to the end of the ground truth | 0.540 m over 132 s |
+| gate 0.5, coasting on the IMU | 130.5 s — to the end of the ground truth | 0.540 m over 132 s |
 | gate 0.3 / 0.7, coasting on the IMU | 88.5 s / 88.5 s | 0.451 / 0.474 m |
 
-Read the last row before the bold one. Both mechanisms are fixed for good — the map no longer
-collapses, the attitude no longer walks — but at 0.3 and 0.7 the run still breaks near 88.5 s, so
-130 s is one good outcome of a fragile section, not a solved one. What breaks there *now* is on the
-vision side: at the window solve where the speed jumps, vision's share of the window's starting cost
-is 20–150× normal — the window is handed landmarks that disagree with its keyframes. (Not inserting
-refused frames at all was tried; it starves the map at the 40 s turn and fails at 40 s.)
+Read the last row. Both mechanisms were fixed for good — the map no longer collapses, the attitude
+no longer walks — but at 0.3 and 0.7 the run still broke near 88.5 s, so 130 s was one good outcome
+of a fragile section. What broke there was on the vision side: at the first window solve after the
+coast, vision's share of the starting cost was 20–150× normal, and 591 of 634 views sat more than
+20 px off. (Not inserting refused frames at all was tried; it starves the map and fails at 40 s.)
 
-**So what is next** is still quality: where the fast section's inconsistent landmarks come from, and
-the global inertial refinement above.
+**Forgetting what the map dropped — built, measured, on.** Split by keyframe, that spike was *not* in
+the newest keyframe (2.7k, normal) but spread across the older ones (75k–147k each). The chain:
+
+1. a refused frame coasts and is inserted into the map at the IMU's guess;
+2. at that guess, good landmarks reproject more than 8 px off, so the map drops them as outliers;
+3. their KLT ids live on, and a few frames later re-triangulate from the coast poses at *new*
+   positions — 70 such tracks in the one frame at 87.75 s (median: 1);
+4. the newest keyframe agrees with the new positions — it was taken at those poses — while every
+   older keyframe still holds its view of the *old* landmark, under the same id.
+
+The window was fitting ten keyframes to points half of them never saw. ORB-SLAM3 closes this with
+`EraseMapPointMatch`: an outlier's observations leave the keyframes. Now so do ours
+(`KeyframeWindow::forget`, `WindowParams::forget_outliers`). The window also drops, before each solve,
+every view more than 8 px off at its starting state (`WindowParams::outlier_px` — ORB-SLAM3's chi²
+outlier edges, VINS-Fusion's 3 px cut); a normal solve loses a median of one view. Never re-triangulating
+a dropped track instead (`--no-recycle`) starves the map: lost at 78 s at every gate.
+
+| first >1 m · median err | gate 0 | gate 0.3 | gate 0.5 | gate 0.7 |
+|---|---|---|---|---|
+| neither (`--no-forget --window-outlier-px=0`) | 88.4 s · 0.455 | 88.5 s · 0.451 | 130.5 s · 0.540 | 88.5 s · 0.474 |
+| 8 px drop only (`--no-forget`) | never · 0.379 | never · 0.329 | never · 0.327 | never · 0.347 |
+| forget only (`--window-outlier-px=0`) | never · 0.380 | never · 0.375 | never · 0.414 | never · 0.386 |
+| **both (default)** | never · 0.403 | never · 0.338 | **never · 0.330** | never · 0.359 |
+
+Either one alone holds, and they do it differently. The drop alone survives by going blind: at
+87.85 s it strips 526 of 552 views and the IMU carries the window. Forget removes the *cause* — the
+stale views — and the window keeps ~100 honest ones through the coast. Both are on: forget because
+it is the fix, the drop because it is the standard guard against the next source of bad views. The
+drop's threshold is not delicate either — 5, 10, 20 and 40 px all hold at every gate.
+
+**So what is next** is the gravity story (still 4° off at the end: the global inertial refinement
+above), and a second sequence — every number here is V1_01's.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -369,6 +400,10 @@ not diverge. Phase-aware top-up is still a sensible cleanup, but it is not the f
 - **PnP is a seed, not a state.** Adopted unfused on a frame whose solve was just refused, it walked
   the attitude 8° in 0.3 s. And a pose that fits every pixel can still carry a garbage velocity: a
   camera does not observe velocity, so a reprojection check can never vouch for one.
+- **A track id is not a landmark.** KLT ids outlive the map's verdict on them: an id dropped as an
+  outlier and re-triangulated is a new point under an old name, and whatever still holds the old
+  views — here the keyframe window — is fitting a point that no longer exists. Drop the point, drop
+  its views.
 - **`imu_prior_weight` > 1 is not a test of the IMU.** It compounds through the carried covariance
   and spirals into over-confidence; it diverged even on a ground-truth map. Calibrate the noise
   densities, never the weight.
@@ -389,10 +424,12 @@ not diverge. Phase-aware top-up is still a sensible cleanup, but it is not the f
 ## Lab — the measurement discipline itself
 
 `estimator_check` drives the **real** `VioEstimator` deterministically (no ROS, no threads, no dropped
-frames) and writes a 58-column per-frame CSV. Past the pose, velocity and bias columns it records
+frames) and writes a 63-column per-frame CSV. Past the pose, velocity and bias columns it records
 the latest window solve (landmarks, cost before and after and its split into prior / IMU / vision,
+vision's starting cost per keyframe, views it dropped as outliers and views more than 20 px off,
 iterations, how far it moved the newest keyframe, landmarks it triangulated, and its worst IMU
-factor's interval and rotation / velocity / position residuals), why the map's pending tracks did not
+factor's interval and rotation / velocity / position residuals), dropped tracks re-triangulated,
+why the map's pending tracks did not
 mature that frame, the tracker's fit (median pixel error and inliers), its attitude and gravity error
 against the truth, and how far PnP moved the seed. Error is aligned to ground truth at the bootstrap
 instant — a raw $\lVert\mathbf{p}_{\text{est}}-\mathbf{p}_{\text{gt}}\rVert$ is meaningless because
@@ -430,7 +467,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--px-sigma=PX] [--imu-weight=W] [--imu-noise-x=K] \
                                  [--no-window] [--anchor-gauge] [--kf-every=N] [--window=K] \
                                  [--window-tri] [--no-map-tri] [--gravity] [--gravity-sigma=DEG] \
-                                 [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp]
+                                 [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp] \
+                                 [--no-forget] [--window-outlier-px=PX] [--no-recycle]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

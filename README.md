@@ -43,8 +43,8 @@ lab behind every claim.
   of ORB-SLAM3's local inertial BA. This is what holds the metric scale (speed ratio 1.02; 0.78
   without it).
 
-It tracks all 132 s of V1_01's ground truth at 0.54 m median error, and the error first passes 1 m
-at 130 s — though the fast section near 88 s is still fragile. Odometry only — no
+It tracks all 132 s of V1_01's ground truth at 0.33 m median error, and the error never passes 1 m.
+Odometry only — no
 loop closure. What is still open (the accel bias, gravity's tilt, the fast-motion sections) and how
 each was measured is in [doc/08-sliding-window.md](doc/08-sliding-window.md).
 

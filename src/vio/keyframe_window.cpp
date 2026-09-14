@@ -97,6 +97,15 @@ void KeyframeWindow::push(Keyframe kf)
   }
 }
 
+void KeyframeWindow::forget(const std::vector<long> & ids)
+{
+  for (auto & kf : kfs_) {
+    for (const long id : ids) {
+      kf.obs.erase(id);
+    }
+  }
+}
+
 WindowResult KeyframeWindow::optimize(
   const std::unordered_map<long, Eigen::Vector3d> & landmarks, const ImuBuffer & imu,
   const CameraCalib & calib, const ReprojectionParams & reproj, const Eigen::Vector3d & gravity)
@@ -161,6 +170,27 @@ WindowResult KeyframeWindow::optimize(
       }
       tracks[it->second].obs.emplace_back(k, Eigen::Vector2d(o.second.x, o.second.y));
     }
+  }
+  // --- Gross outliers, kept out of the solve entirely (WindowParams::outlier_px).
+  if (p_.outlier_px > 0.0) {
+    for (auto & tr : tracks) {
+      const std::size_t before = tr.obs.size();
+      tr.obs.erase(
+        std::remove_if(
+          tr.obs.begin(), tr.obs.end(),
+          [&](const std::pair<int, Eigen::Vector2d> & o) {
+            Eigen::Vector3d P_i, P_c;
+            return !landmarkInCamera(
+              kfs_[o.first].x, tr.X, calib.T_cam_imu, reproj.min_depth, P_i, P_c) ||
+                   reprojectionResidual(P_c, o.second, calib).norm() > p_.outlier_px;
+          }),
+        tr.obs.end());
+      out.outliers_removed += static_cast<int>(before - tr.obs.size());
+    }
+    tracks.erase(
+      std::remove_if(
+        tracks.begin(), tracks.end(), [](const Track & tr) {return tr.obs.size() < 2;}),
+      tracks.end());
   }
   if (tracks.empty()) {
     return out;
@@ -348,6 +378,22 @@ WindowResult KeyframeWindow::optimize(
       out.worst_imu_rot_deg = r.segment<3>(0).norm() * 180.0 / M_PI;
       out.worst_imu_vel = r.segment<3>(3).norm();
       out.worst_imu_pos = r.segment<3>(6).norm();
+    }
+  }
+  out.vis_cost_before_kf.assign(n, 0.0);
+  for (std::size_t l = 0; l < tracks.size(); ++l) {   // vision, per keyframe, before the solve
+    for (const auto & [k, z] : tracks[l].obs) {
+      ++out.vis_obs_before;
+      Eigen::Vector3d P_i, P_c;
+      if (!landmarkInCamera(xs[k], Xs[l], calib.T_cam_imu, reproj.min_depth, P_i, P_c)) {
+        out.vis_cost_before_kf[k] += behind_cost;
+        ++out.vis_bad_obs_before;
+        continue;
+      }
+      const PixelResidual r = reprojectionResidual(P_c, z, calib);
+      out.vis_cost_before_kf[k] +=
+        huberCost(r(0) * inv_s, delta) + huberCost(r(1) * inv_s, delta);
+      out.vis_bad_obs_before += r.norm() > 20.0;
     }
   }
   double lambda = 1e-4;

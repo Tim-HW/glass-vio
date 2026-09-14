@@ -82,6 +82,15 @@ struct WindowParams
   /// divergence was exactly such a prior with nothing to restore it (doc/08 §3). Here every IMU
   /// factor in the window is a restoring force -- and the value is measured, not argued.
   double gravity_sigma_deg = 1.0;
+  /// Drop, before the solve, every observation more than this many pixels off at the window's
+  /// starting state; 0 = off. Huber bounds one outlier's pull, but hundreds still pull. ORB-SLAM3
+  /// marks edges above their chi2 bound as outliers and re-solves without them; VINS-Fusion drops
+  /// a feature above 3 px. 8 px is the tracker's and the map's own threshold; measured, 5-40 px all
+  /// hold, 8 has the lowest drift (doc/08 §6). (estimator_check --window-outlier-px=PX; 0 = off.)
+  double outlier_px = 8.0;
+  /// When the map drops a landmark as an outlier, erase its observations from the window's
+  /// keyframes (KeyframeWindow::forget). (estimator_check --no-forget to compare.)
+  bool forget_outliers = true;
 };
 
 struct Keyframe
@@ -112,6 +121,13 @@ struct WindowResult
   double worst_imu_rot_deg = 0.0;
   double worst_imu_vel = 0.0;   ///< m/s
   double worst_imu_pos = 0.0;   ///< m
+  /// Vision's share of cost_before per keyframe (0 = the anchor), and how many of the window's
+  /// observations sat more than 20 px off before the solve: where the bad landmarks are seen
+  /// from, and how many there are.
+  std::vector<double> vis_cost_before_kf;
+  int vis_obs_before = 0;
+  int vis_bad_obs_before = 0;
+  int outliers_removed = 0;   ///< observations WindowParams::outlier_px kept out of this solve
   /// How far the solve moved the NEWEST keyframe, m. The tracker resumes from it, so a large
   /// value is a jump the tracker has to survive -- the first thing to look at when it doesn't.
   double newest_shift_m = 0.0;
@@ -178,6 +194,10 @@ public:
   /// the anchor. Dropped outright, as ORB-SLAM3 does -- no marginalization prior (Stage B).
   void push(Keyframe kf);
   void clear() {kfs_.clear();}
+  /// Erase these tracks' observations from every keyframe -- ORB-SLAM3's EraseMapPointMatch. The
+  /// map dropped them as outliers; if a track comes back it is a NEW landmark, and the old views
+  /// were of the one that no longer exists.
+  void forget(const std::vector<long> & ids);
   const std::deque<Keyframe> & keyframes() const {return kfs_;}
 
   /// Jointly re-estimate every keyframe state and every landmark two or more keyframes see.

@@ -41,6 +41,8 @@ void LandmarkMap::clear()
   landmarks_.clear();
   pending_.clear();
   last_seen_.clear();
+  dropped_outliers_.clear();
+  last_outliers_.clear();
   frame_ = 0;
   last_triangulated_ = 0;
   last_dropped_ = 0;
@@ -108,6 +110,7 @@ void LandmarkMap::insert(
   ++frame_;
   last_triangulated_ = 0;
   last_dropped_ = 0;
+  last_outliers_.clear();
   stats_ = TriangulationStats();
 
   const Eigen::Isometry3d T_cam_w = T_world_cam.inverse();
@@ -131,6 +134,8 @@ void LandmarkMap::insert(
         if ((proj - Eigen::Vector2d(px.x, px.y)).norm() > p_.max_reprojection_px) {
           landmarks_.erase(known);
           last_seen_.erase(id);
+          dropped_outliers_.insert(id);
+          last_outliers_.push_back(id);
           ++last_dropped_;
         }
       }
@@ -139,6 +144,10 @@ void LandmarkMap::insert(
 
     if (!p_.triangulate) {
       continue;   // new landmarks come from the keyframe window instead
+    }
+    const bool was_outlier = dropped_outliers_.count(id) > 0;
+    if (was_outlier && !p_.recycle_outliers) {
+      continue;   // dropped as an outlier once: this track does not come back as a new landmark
     }
 
     // --- Not a landmark yet: accumulate observations until the baseline is worth using.
@@ -164,6 +173,7 @@ void LandmarkMap::insert(
     stats_.depth += tri == TriResult::Depth;
     stats_.parallax += tri == TriResult::Parallax;
     if (tri == TriResult::Ok) {
+      stats_.recycled += was_outlier;
       landmarks_.emplace(id, X);
       last_seen_[id] = frame_;
       pending_.erase(id);

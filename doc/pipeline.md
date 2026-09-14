@@ -94,7 +94,7 @@ V1_01:
 | [1] Feature tracking | ✅ FAST + KLT, persistent ids, radtan undistortion at the boundary. |
 | [2] Sync | ✅ Working; IMU spliced across dropped frames. |
 | [3] Bootstrap | ✅ Metric scale via the observability gate — 1.62 m landmark depth, gyro bias to ~2%. |
-| [4] Track | ✅ Tight solve + sliding-window map, plus Stage A's keyframe-window bundle adjustment and an inlier gate on every tracker solve. Tracks all 132 s of the ground truth at metric scale (speed ratio 1.02), median drift 0.54 m; the error first passes 1 m at 130 s, though the fast section near 88 s is still fragile. |
+| [4] Track | ✅ Tight solve + sliding-window map, plus Stage A's keyframe-window bundle adjustment and an inlier gate on every tracker solve. Tracks all 132 s of the ground truth at metric scale (speed ratio 1.00), median drift 0.33 m; the error never passes 1 m, at any tracker gate from 0 to 0.7. |
 
 The offline thesis check `vio_check` is **0.036 m**; the unit suites are green. **Two residuals
 remain** ([Module 8](08-sliding-window.md)): a ~20% scale shrink and a fast-motion divergence. Traced

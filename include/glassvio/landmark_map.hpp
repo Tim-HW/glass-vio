@@ -2,6 +2,7 @@
 #define GLASSVIO_LANDMARK_MAP_HPP
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Core>
@@ -39,6 +40,11 @@ struct LandmarkMapParams
   /// window also triangulates, from its optimized poses; false leaves new landmarks to the window
   /// alone (estimator_check --no-map-tri).
   bool triangulate = true;
+  /// Let a track whose landmark was DROPPED AS AN OUTLIER be triangulated again. Its KLT id lives
+  /// on, so the next frames re-triangulate it from the recent poses -- at a new position -- while
+  /// the keyframe window still holds the observations the old one was made from.
+  /// (estimator_check --no-recycle to compare.)
+  bool recycle_outliers = true;
 };
 
 /// THE LOCAL MAP, for landmarks -- glasslio's LocalMap, with points instead of planes.
@@ -96,6 +102,9 @@ public:
   /// if this is persistently zero while size() falls, the solve is about to starve.
   int lastTriangulated() const {return last_triangulated_;}
   int lastDropped() const {return last_dropped_;}
+  /// Ids dropped AS OUTLIERS on the last insert() -- the observations anyone else holds of them
+  /// were made of a landmark that no longer exists.
+  const std::vector<long> & lastOutliers() const {return last_outliers_;}
 
   /// Why pending tracks did NOT become landmarks on the last insert() -- the diagnostic for
   /// tracks that pile up without maturing (doc/08 §6).
@@ -106,6 +115,7 @@ public:
     int depth = 0;         ///< behind a camera, or absurdly far
     int parallax = 0;      ///< rays too close to parallel: WAITING for baseline, not failing
     int expired = 0;       ///< pending tracks dropped unmatured -- the tracker lost them
+    int recycled = 0;      ///< matured tracks whose id was dropped as an outlier before
   };
   const TriangulationStats & lastStats() const {return stats_;}
 
@@ -132,6 +142,8 @@ private:
   int last_triangulated_ = 0;
   int last_dropped_ = 0;
   TriangulationStats stats_;
+  std::unordered_set<long> dropped_outliers_;   ///< ids once dropped as outliers
+  std::vector<long> last_outliers_;
 };
 
 }  // namespace glassvio

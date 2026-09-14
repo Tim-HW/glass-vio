@@ -113,6 +113,9 @@ int main(int argc, char ** argv)
   //                   coasted pose (starved frames still are)
   //   --coast-on-pnp  a coast frame adopts the PnP-replaced seed, as before, instead of the IMU
   //                   prediction
+  //   --no-recycle    a track dropped as an outlier is never triangulated again
+  //   --no-forget     the window keeps its views of a landmark the map dropped as an outlier
+  //   --window-outlier-px=PX  the window drops observations more than PX off before solving
   std::vector<std::string> pos;
   std::string mode = "est-ba";
   bool oracle_map = false;
@@ -131,6 +134,9 @@ int main(int argc, char ** argv)
   double inlier_fraction = -1.0;   // < 0 = the default
   bool no_refused_insert = false;
   bool coast_on_pnp = false;
+  bool no_recycle = false;
+  bool no_forget = false;
+  double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
   bool report_only = false;
   std::string gt_path;
@@ -199,6 +205,12 @@ int main(int argc, char ** argv)
         no_refused_insert = true;
       } else if (a == "--coast-on-pnp") {
         coast_on_pnp = true;
+      } else if (a == "--no-recycle") {
+        no_recycle = true;
+      } else if (a == "--no-forget") {
+        no_forget = true;
+      } else if (a.rfind("--window-outlier-px=", 0) == 0) {
+        window_outlier_px = nonnegativeNumber(a.substr(20));
       } else if (!a.empty() && a.front() == '-') {
         throw std::invalid_argument("unknown option: " + a);
       } else {
@@ -283,6 +295,11 @@ int main(int argc, char ** argv)
   }
   ep.coast_insert_refused = !no_refused_insert;
   ep.coast_on_pnp = coast_on_pnp;
+  ep.map.recycle_outliers = !no_recycle;
+  ep.window.forget_outliers = !no_forget;
+  if (window_outlier_px >= 0.0) {
+    ep.window.outlier_px = window_outlier_px;
+  }
   std::printf(
     "tracker solves refused below an inlier fraction of %.2f\n", ep.visual.min_inlier_fraction);
   std::printf(
@@ -319,7 +336,8 @@ int main(int argc, char ** argv)
     "tri_try,tri_inf,tri_depth,tri_par,pend_exp,grav_err_deg,med_px,inliers,"
     "win_c0_prior,win_c0_imu,win_c0_vis,"
     "win_kfs,imu_worst_k,imu_worst_dt,imu_worst_rot_deg,imu_worst_vel,imu_worst_pos,"
-    "rot_err_deg,pnp_jump_deg,pnp_jump_m\n";
+    "rot_err_deg,pnp_jump_deg,pnp_jump_m,win_vis_obs,win_vis_bad,win_vis_kf,"
+    "tri_recycled,win_outl\n";
   csv.setf(std::ios::fixed);
   csv.precision(6);
 
@@ -477,6 +495,11 @@ int main(int argc, char ** argv)
         std::isfinite(pos_err) && std::isfinite(vel_err) && std::isfinite(grav_err);
       const Eigen::Vector3d gbg = bag.gt.gyroBias(f.t);
       const Eigen::Vector3d gba = bag.gt.accelBias(f.t);
+      // The window's vision cost per keyframe, anchor first, as one ';'-joined field.
+      std::string vis_kf;
+      for (const double c : est.lastWindow().vis_cost_before_kf) {
+        vis_kf += (vis_kf.empty() ? "" : ";") + std::to_string(static_cast<long>(c));
+      }
       csv << (f.t - t0) << ","
           << (r.stage == glassvio::FrameResult::Stage::Bootstrapped ? "boot" : "track") << ","
           << r.features << "," << est.map().size() << "," << est.map().pending() << ","
@@ -504,7 +527,9 @@ int main(int argc, char ** argv)
           << est.lastWindow().worst_imu_k << "," << est.lastWindow().worst_imu_dt << ","
           << est.lastWindow().worst_imu_rot_deg << "," << est.lastWindow().worst_imu_vel << ","
           << est.lastWindow().worst_imu_pos << "," << rot_err << "," << r.pnp_jump_deg << ","
-          << r.pnp_jump_m << "\n";
+          << r.pnp_jump_m << "," << est.lastWindow().vis_obs_before << ","
+          << est.lastWindow().vis_bad_obs_before << "," << vis_kf << ","
+          << est.map().lastStats().recycled << "," << est.lastWindow().outliers_removed << "\n";
     }
     if (r.stage == glassvio::FrameResult::Stage::Lost && bootstrapped_at >= 0) {
       break;
