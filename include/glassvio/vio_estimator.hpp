@@ -155,6 +155,11 @@ public:
   const std::string & lastFailure() const {return last_failure_;}
   int lastLandmarks() const {return last_landmarks_;}
   int lastBiasPairs() const {return last_bias_pairs_;}
+  /// The last bootstrap attempt's full result -- the numbers behind lastFailure()'s verdict.
+  const InitResult & lastInit() const {return last_init_;}
+  int bootstrapAttempts() const {return bootstrap_attempts_;}
+  /// Stamp of each frame lastInit().sfm posed, by the same index -- to score it against truth.
+  const std::unordered_map<int, double> & lastInitTimes() const {return last_init_t_;}
   const NavState & state() const {return x_;}
   /// Landmarks, metric, in the world frame. Maintained by LandmarkMap: fixed WITHIN a solve
   /// (that is what keeps the state at 15 DoF), but grown and pruned between them.
@@ -216,6 +221,9 @@ private:
   int last_landmarks_ = 0;
   int last_bias_pairs_ = 0;
   int since_attempt_ = 0;
+  InitResult last_init_;
+  int bootstrap_attempts_ = 0;
+  std::unordered_map<int, double> last_init_t_;
   int warmup_ = 0;
 };
 

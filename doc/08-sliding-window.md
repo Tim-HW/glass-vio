@@ -395,8 +395,35 @@ median depth, 3.1° tilt) and its medians run over 129 s instead of 132. V1_02 a
 first numbers from a sequence the estimator was not developed on — and on V1_02 the harness's 60 s
 minimum is out of reach when the bootstrap is at 32.9 s of an 85 s flight.
 
-**So what is next** is the fast sequences: V1_02 passes 1 m at 74.2 s and V1_03 at 97.0 s. And the
-bootstraps take 15–44 s to arrive.
+**Why the bootstrap waits — measured, one bug fixed, the main cause open.** V1_02 bootstraps at
+32.9 s and V1_03 at 44.4 s, while the vehicle flies at 0.3–1.7 m/s from the first seconds. With
+`estimator_check --init-log`, every attempt prints the stage that refused it and that stage's
+numbers, and — against ground truth, scale-free — how wrong the reconstruction was:
+
+| attempts refused by (before the PnP fix below) | V1_01 | V1_02 | V1_03 |
+|---|---|---|---|
+| [2] SfM: no base pair with ≥ 100 landmarks | 7 | 47 | 119 |
+| [3] gyro bias: too few pairs | 9 | 3 | 15 |
+| [4] \|g\| implausible | 2 | 18 | 8 |
+| [4] scale ≤ 0, or σ_s/s above 0.06 | 19 | 39 | 11 |
+
+- **SfM is starved, not blind.** Most refusals tried a base pair and triangulated 40–99 landmarks
+  against `min_landmarks` 100; the rest shared fewer than 60 tracks with the base frame. More
+  corners (`--fast=12`) let SfM through far more often — and V1_02 then bootstraps at *81 s*,
+  because the windows it lets through die in the alignment. The SfM gate was hiding the next one.
+- **A flipped PnP pose — fixed.** The \|g\| refusals carried a pose ~177° off: 70 of 70 came from
+  the PnP that propagates the ruler, none from the base pair. `solvePnPRansac` never had its inlier
+  count checked, and a pose rotated half a turn with the landmarks *behind* the camera reprojects
+  them just as well. It now needs `min_pnp_points` inliers, all in front. Flips: 70 → 1; the
+  refusals moved to the scale gate, and no bootstrap time changed.
+- **The scale collapses — open.** Windows refused on scale have decent geometry (rotation 0.6–0.9°,
+  translation direction 4–8° off) yet solve s ≈ 0.03× the truth; accepted ones land at 0.87–0.96×.
+  A longer window (`--sfm-window=30/40`) is not the fix: it moves V1_03's bootstrap to 58 s with a
+  1.8× speed error that the 0.06 gate *accepted*.
+
+**So what is next** is the alignment's scale: why good reconstructions give s → 0, and why even
+accepted ones sit ~10% low. Oracle substitution again — ground-truth rotations or positions into
+stage [4] — says whether it is the SfM input or the alignment itself.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -503,7 +530,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--no-window] [--anchor-gauge] [--kf-every=N] [--window=K] \
                                  [--window-tri] [--no-map-tri] [--gravity] [--gravity-sigma=DEG] \
                                  [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp] \
-                                 [--no-forget] [--window-outlier-px=PX] [--no-recycle]
+                                 [--no-forget] [--window-outlier-px=PX] [--no-recycle] \
+                                 [--init-log] [--fast=N] [--sfm-window=N]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

@@ -67,6 +67,11 @@ struct SfmWindow
   /// means candidates were rejected by the GEOMETRY -- i.e. they were rotation-dominated,
   /// which is the failure a flow threshold alone cannot see.
   int candidates_tried = 0;
+  /// The most tracks any frame shared with the base (against min_shared), and the most
+  /// landmarks any tried candidate triangulated (against min_landmarks) -- which gate a failed
+  /// window fell short of, and by how much.
+  int max_shared = 0;
+  int max_trial_landmarks = 0;
 
   /// X_ck = pose[k] * X_c0. Translations are in RULER units, not metres.
   std::unordered_map<int, Eigen::Isometry3d> pose;
@@ -267,6 +272,7 @@ inline SfmWindow buildSfmWindow(
 
   for (int k = begin + 2; k < end; ++k) {
     const auto ids = detail::sharedIds(base, frames[k]);
+    w.max_shared = std::max(w.max_shared, static_cast<int>(ids.size()));
     if (static_cast<int>(ids.size()) < p.min_shared) {
       continue;
     }
@@ -310,6 +316,8 @@ inline SfmWindow buildSfmWindow(
     //     pixel-flow threshold cannot make: rotation survives the filter above and dies here.
     SfmWindow trial;
     triangulateBasePair(p1, p2, pair_ids, T2, mask, calib, p, trial);
+    w.max_trial_landmarks =
+      std::max(w.max_trial_landmarks, static_cast<int>(trial.landmark.size()));
     if (static_cast<int>(trial.landmark.size()) < p.min_landmarks) {
       w.rejected_parallax += trial.rejected_parallax;
       w.rejected_cheirality += trial.rejected_cheirality;
@@ -349,8 +357,11 @@ inline SfmWindow buildSfmWindow(
     if (static_cast<int>(obj.size()) < p.min_pnp_points) {
       continue;
     }
-    cv::Mat rvec, tvec;
-    if (!cv::solvePnPRansac(obj, img, K_cv, cv::Mat(), rvec, tvec, false, 100, 2.0, 0.99)) {
+    cv::Mat rvec, tvec, inliers;
+    if (!cv::solvePnPRansac(
+        obj, img, K_cv, cv::Mat(), rvec, tvec, false, 100, 2.0, 0.99, inliers) ||
+      inliers.rows < p.min_pnp_points)
+    {
       continue;
     }
     cv::Mat Rk;
@@ -359,6 +370,17 @@ inline SfmWindow buildSfmWindow(
     T.linear() = detail::matFromCv(Rk);
     T.translation() = Eigen::Vector3d(
       tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
+    // CHEIRALITY. A pose rotated ~180 deg with the landmarks BEHIND the camera reprojects them
+    // just as well, and RANSAC happily returns it from a few points: measured on V1_02, every
+    // flipped pose in a refused bootstrap (70 of 70) came from here, not from the base pair.
+    int in_front = 0;
+    for (int i = 0; i < inliers.rows; ++i) {
+      const cv::Point3f & X = obj[inliers.at<int>(i)];
+      in_front += (T * Eigen::Vector3d(X.x, X.y, X.z)).z() > 0.0;
+    }
+    if (in_front < inliers.rows) {
+      continue;
+    }
     w.pose[k] = T;
   }
 

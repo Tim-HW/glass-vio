@@ -115,6 +115,9 @@ int main(int argc, char ** argv)
   //                   prediction
   //   --no-recycle    a track dropped as an outlier is never triangulated again
   //   --no-forget     the window keeps its views of a landmark the map dropped as an outlier
+  //   --init-log      one line per bootstrap attempt: the stage that refused, and its numbers
+  //   --sfm-window=N  frames the bootstrap reconstructs and aligns over (the node uses 30)
+  //   --fast=N        the tracker's FAST corner threshold (default 20)
   //   --window-outlier-px=PX  the window drops observations more than PX off before solving
   std::vector<std::string> pos;
   std::string mode = "est-ba";
@@ -136,6 +139,9 @@ int main(int argc, char ** argv)
   bool coast_on_pnp = false;
   bool no_recycle = false;
   bool no_forget = false;
+  bool init_log = false;
+  int fast_threshold = 20;
+  int sfm_window = 0;   // 0 = the initializer default
   double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
   bool report_only = false;
@@ -209,6 +215,12 @@ int main(int argc, char ** argv)
         no_recycle = true;
       } else if (a == "--no-forget") {
         no_forget = true;
+      } else if (a == "--init-log") {
+        init_log = true;
+      } else if (a.rfind("--sfm-window=", 0) == 0) {
+        sfm_window = static_cast<int>(nonnegativeNumber(a.substr(13)));
+      } else if (a.rfind("--fast=", 0) == 0) {
+        fast_threshold = static_cast<int>(nonnegativeNumber(a.substr(7)));
       } else if (a.rfind("--window-outlier-px=", 0) == 0) {
         window_outlier_px = nonnegativeNumber(a.substr(20));
       } else if (!a.empty() && a.front() == '-') {
@@ -238,7 +250,10 @@ int main(int argc, char ** argv)
   glassvio::EurocDataset bag;
   try {
     calib = glassvio::loadEurocCalib(calib_dir);
-    bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, {true, -1});
+    glassvio::DatasetOptions opts;
+    opts.track_images = true;
+    opts.fast_threshold = fast_threshold;
+    bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, opts);
   } catch (const std::exception & e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;
@@ -297,6 +312,9 @@ int main(int argc, char ** argv)
   ep.coast_on_pnp = coast_on_pnp;
   ep.map.recycle_outliers = !no_recycle;
   ep.window.forget_outliers = !no_forget;
+  if (sfm_window > 0) {
+    ep.init.window_frames = sfm_window;
+  }
   if (window_outlier_px >= 0.0) {
     ep.window.outlier_px = window_outlier_px;
   }
@@ -393,7 +411,63 @@ int main(int argc, char ** argv)
       g.imu.push_back(toMsg(imu[imu_cursor++]));
     }
 
+    const int attempts_before = est.bootstrapAttempts();
     const glassvio::FrameResult r = est.process(g);
+    if (init_log && est.bootstrapAttempts() != attempts_before) {
+      const glassvio::InitResult & ir = est.lastInit();
+      std::printf(
+        "init %6.2f s  shared %3d cand %2d best_lm %3d lm %3zu pairs %3d intervals %3d "
+        "|g| err %5.2f%% s %.4f sigma_s/s %.3f ba_std %.2f  %s\n",
+        f.t - t0, ir.sfm.max_shared, ir.sfm.candidates_tried, ir.sfm.max_trial_landmarks,
+        ir.sfm.landmark.size(), ir.bias_pairs, ir.align_intervals,
+        100.0 * std::abs(ir.gravity_sfm.norm() - 9.80665) / 9.80665, ir.scale,
+        ir.scale_uncertainty, ir.accel_bias_std,
+        est.lastFailure().empty() ? "OK" : est.lastFailure().c_str());
+      // The reconstruction against the truth, scale-free: every posed frame relative to the
+      // base -- body rotation error, translation DIRECTION error, and the metres per ruler unit
+      // the truth implies (median), next to the s the alignment solved.
+      if (ir.sfm.pose.count(ir.sfm.base) && est.lastInitTimes().count(ir.sfm.base)) {
+        const Eigen::Isometry3d T_ci = calib.T_cam_imu;
+        const Eigen::Isometry3d G0 = bag.gt.at(est.lastInitTimes().at(ir.sfm.base));
+        std::vector<double> rot, dir, s_true;
+        double worst_rot = -1.0;
+        int worst_k = -1;
+        for (const auto & kv : ir.sfm.pose) {
+          if (kv.first == ir.sfm.base) {
+            continue;
+          }
+          // body k in body 0: SfM gives T_ck_c0 = pose[k]; T_b0_bk = T_ic * T_c0_ck * T_ci.
+          const Eigen::Isometry3d S = T_ci.inverse() * kv.second.inverse() * T_ci;
+          const Eigen::Isometry3d G = G0.inverse() * bag.gt.at(est.lastInitTimes().at(kv.first));
+          rot.push_back(
+            Eigen::AngleAxisd(S.linear().transpose() * G.linear()).angle() * 180.0 / M_PI);
+          if (rot.back() > worst_rot) {
+            worst_rot = rot.back();
+            worst_k = kv.first;
+          }
+          // camera-centre translation is what SfM measures; compare c0->ck in the base camera.
+          const Eigen::Vector3d ts = kv.second.inverse().translation();
+          const Eigen::Vector3d tg = (T_ci * G * T_ci.inverse()).translation();
+          if (ts.norm() > 1e-9 && tg.norm() > 0.01) {
+            dir.push_back(
+              std::acos(std::clamp(ts.normalized().dot(tg.normalized()), -1.0, 1.0)) * 180.0 /
+              M_PI);
+            s_true.push_back(tg.norm() / ts.norm());
+          }
+        }
+        const auto med = [](std::vector<double> v) {
+            if (v.empty()) {return std::nan("");}
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+          };
+        std::printf(
+          "     vs truth: %zu poses, rot err med %.2f max %.2f deg, dir err med %.1f deg, "
+          "s_true %.4f (solved %.4f)  worst: frame %+d from base%s\n", rot.size(), med(rot),
+          rot.empty() ? std::nan("") : *std::max_element(rot.begin(), rot.end()), med(dir),
+          med(s_true), ir.scale, worst_k - ir.sfm.base,
+          worst_k == ir.sfm.second ? " (the base pair)" : " (PnP)");
+      }
+    }
 
     const bool tracking_now = r.stage == glassvio::FrameResult::Stage::Bootstrapped ||
       r.stage == glassvio::FrameResult::Stage::Tracking;

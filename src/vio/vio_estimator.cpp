@@ -57,7 +57,13 @@ bool VioEstimator::bootstrap()
   // the recent ones. Two spans, again.
   const int begin = std::max(
     0, static_cast<int>(frames_.size()) - p_.init.window_frames);
-  const InitResult r = init_->run(frames_, imu_, begin);
+  last_init_ = init_->run(frames_, imu_, begin);
+  ++bootstrap_attempts_;
+  last_init_t_.clear();
+  for (const auto & kv : last_init_.sfm.pose) {
+    last_init_t_[kv.first] = frames_[kv.first].t;
+  }
+  const InitResult & r = last_init_;
 
   // WHICH STAGE FAILED, not merely that one did. A bare bool here cost an hour: the node sat
   // on "collecting..." forever and the reason (stage [3] starved of pairs) was invisible.
@@ -69,8 +75,10 @@ bool VioEstimator::bootstrap()
     "[4] align: too few intervals" :
     !r.ok ?
     "[4] align: |g| implausible -- formulation, frames or extrinsic" :
-    !r.scale_observable ?
+    r.scale <= 0.0 ?
     "[4] scale not observable (s <= 0: the s/v_0 ridge won -- no accelerometer excitation)" :
+    !r.scale_observable ?
+    "[4] scale too uncertain (sigma_s/s above max_scale_uncertainty)" :
     "";
   last_landmarks_ = static_cast<int>(r.sfm.landmark.size());
   last_bias_pairs_ = r.bias_pairs;
