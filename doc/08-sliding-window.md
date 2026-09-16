@@ -488,9 +488,38 @@ that stays off.
 **Against the state of the art** (RMS ATE, V1_01/02/03): glassvio 0.106 / 0.161 / 0.254 m — VINS-Mono
 0.047 / 0.066 / 0.180, ORB-SLAM3 0.049 / 0.015 / 0.037 — now tracking all three to the end.
 
-**So what is next:** the bootstrap is still slow and still starts ~20% off in scale — triangulate the
-whole window's tracks before the bundle adjustment, as VINS-Fusion does — and the remaining 2–3× in
-ATE.
+**Three more rungs from VINS-Fusion — built, measured, off.** Each ran on all three sequences
+against bundle adjustment alone (V1_01 / V1_02 / V1_03: bootstrap 14.7 / 16.9 / 33.6 s, never above
+1 m, RMS ATE 0.106 / 0.161 / 0.254 m):
+
+| flag | what | bootstrap | RMS ATE | verdict |
+|---|---|---|---|---|
+| `--sfm-tri` | triangulate every other track of the window before the adjustment | 15.2 / **32.7** / 33.6 s | 0.111 / **0.380** / 0.298 m | V1_02 fails at 66.5 s |
+| `--sfm-ba-free-pair` | fix only the base frame; rescale to keep the pair's distance | 12.9 / 16.7 / 33.6 s | 0.106 / 0.151 / 0.270 m | small, mixed |
+| `--align-stride=4` | align over every 4th frame (200 ms intervals) | 15.4 / 31.7 / 44.6 s | 0.107 / **0.100** / 0.646 m | V1_03 fails at 93.6 s |
+
+The stride is the instructive one. Over one 50 ms interval the accelerometer moves the body about a
+millimetre, while the reconstruction's positions carry more noise than that — and a least-squares
+fit of s against a *noisy* regressor is biased toward zero (errors-in-variables attenuation). That
+predicts the whole pattern: accepted scales a little low, noisier windows collapsing, true positions
+fixing it. Longer intervals do lift the solved scales — windows landing within 20% of the truth go
+from 1 to 9–10 of those reaching the alignment on V1_02 and V1_03 — but the outcomes do not follow,
+because the scale gate then decides differently. Scored against the truth over every window that
+reached it (227 with s > 0):
+
+| σ_s/s below | windows within 20% passed | windows >50% off passed | in between |
+|---|---|---|---|
+| 0.06 (default) | 11 | 0 | 2 |
+| 0.10 | 30 | 2 | 17 |
+| 0.20 | 48 | 15 | 34 |
+
+The gate is *precise* — at 0.06 it has never let a >50% error through — but it throws away four good
+windows in five, and no threshold separates good from bad cleanly (good windows: median 0.10, bad:
+0.38). A 1 s linear solve with a pass/fail gate is the design choice every system above avoids.
+
+**So what is next** is that design choice: accept a rough bootstrap and correct the scale afterwards
+with an inertial-only nonlinear optimization over several seconds of keyframes — ORB-SLAM3's
+InertialOptimization, repeated as the map grows — rather than asking one short window to be right.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -599,7 +628,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp] \
                                  [--no-forget] [--window-outlier-px=PX] [--no-recycle] \
                                  [--init-log] [--fast=N] [--sfm-window=N] \
-                                 [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba]
+                                 [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba] \
+                                 [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

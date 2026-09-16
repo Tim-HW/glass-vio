@@ -33,7 +33,9 @@ struct SfmBundleStats
 /// WHAT. Every posed frame and every landmark, jointly, on reprojection error alone (Huber).
 /// The GAUGE: a reconstruction is fixed only up to a similarity (7 DoF), so the base frame and
 /// its base-pair partner stay FIXED -- which also keeps |t| = 1 at the pair, i.e. the ruler the
-/// alignment's s is measured in. VINS-Fusion fixes the same two frames.
+/// alignment's s is measured in. VINS-Fusion fixes the same two frames. With fix_pair_frame false only
+/// the base is fixed; the pair frame moves, and the solution is rescaled afterwards so its distance from
+/// the base is unchanged -- same ruler, but the essential matrix's baseline DIRECTION can be corrected.
 ///
 /// HOW. Levenberg-Marquardt with each landmark eliminated by its own 3x3 Schur block, the same
 /// structure as KeyframeWindow's. Cameras reuse the reprojection factor through a NavState whose
@@ -41,7 +43,7 @@ struct SfmBundleStats
 /// residual and its right-perturbation Jacobians are the ones test_reprojection pins.
 SfmBundleStats bundleAdjust(
   const std::vector<SfmFrame> & frames, SfmWindow & w, const CameraCalib & calib,
-  int max_iterations = 10, double huber_delta_px = 2.0);
+  int max_iterations = 10, double huber_delta_px = 2.0, bool fix_pair_frame = true);
 
 }  // namespace glassvio
 

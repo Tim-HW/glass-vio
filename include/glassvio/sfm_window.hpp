@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -52,6 +53,14 @@ struct SfmParams
   /// look like the same thing. Measured on V1_01_easy: >=139 landmarks -> residual <7%;
   /// <=61 -> residual >49%. There is no middle.
   int min_landmarks = 100;
+  /// After PnP, triangulate every other track the window's posed frames share -- from the first
+  /// and last frame that see it -- as VINS-Fusion's GlobalSFM does before its bundle adjustment.
+  /// Without it the reconstruction is the base pair's landmarks alone. Kept only through the same
+  /// parallax and cheirality gates, and if it reprojects within max_window_reproj_px in EVERY
+  /// posed view. Off: measured, it raised the collapsed scales a little but pushed V1_02's
+  /// bootstrap from 16.9 to 32.7 s and its ATE from 0.16 to 0.38 m (doc/08 §6). (--sfm-tri)
+  bool triangulate_window = false;
+  double max_window_reproj_px = 3.0;
 };
 
 /// An up-to-scale reconstruction: poses and structure in a world stretched by one unknown
@@ -74,6 +83,7 @@ struct SfmWindow
   /// window fell short of, and by how much.
   int max_shared = 0;
   int max_trial_landmarks = 0;
+  int window_triangulated = 0;   ///< landmarks added beyond the base pair (triangulate_window)
 
   /// X_ck = pose[k] * X_c0. Translations are in RULER units, not metres.
   std::unordered_map<int, Eigen::Isometry3d> pose;
@@ -384,6 +394,68 @@ inline SfmWindow buildSfmWindow(
       continue;
     }
     w.pose[k] = T;
+  }
+
+  // --- 5. The rest of the window's tracks. Grouped by (first, last) posed frame so each pair is
+  //        one triangulatePoints call; the pair's relative pose is what the base-pair helper wants.
+  if (p.triangulate_window) {
+    std::map<std::pair<int, int>, std::vector<long>> by_span;
+    {
+      std::unordered_map<long, std::pair<int, int>> span;
+      for (int k = begin; k < end; ++k) {
+        if (!w.pose.count(k)) {
+          continue;
+        }
+        for (const auto & e : frames[k].by_id) {
+          if (w.landmark.count(e.first)) {
+            continue;
+          }
+          const auto it = span.find(e.first);
+          if (it == span.end()) {
+            span.emplace(e.first, std::make_pair(k, k));
+          } else {
+            it->second.second = k;
+          }
+        }
+      }
+      for (const auto & kv : span) {
+        if (kv.second.first != kv.second.second) {
+          by_span[kv.second].push_back(kv.first);
+        }
+      }
+    }
+    for (const auto & group : by_span) {
+      const int a = group.first.first, b = group.first.second;
+      std::vector<cv::Point2f> pa, pb;
+      for (long id : group.second) {
+        pa.push_back(frames[a].by_id.at(id));
+        pb.push_back(frames[b].by_id.at(id));
+      }
+      SfmWindow trial;
+      triangulateBasePair(
+        pa, pb, group.second, w.pose.at(b) * w.pose.at(a).inverse(), cv::Mat(), calib, p, trial);
+      const Eigen::Isometry3d T_c0_ca = w.pose.at(a).inverse();
+      for (const auto & lm : trial.landmark) {
+        const Eigen::Vector3d X = T_c0_ca * lm.second;
+        bool consistent = true;
+        for (int k = a; k <= b && consistent; ++k) {
+          const auto pose = w.pose.find(k);
+          const auto obs = frames[k].by_id.find(lm.first);
+          if (pose == w.pose.end() || obs == frames[k].by_id.end()) {
+            continue;
+          }
+          const Eigen::Vector3d P = pose->second * X;
+          consistent = P.z() > p.min_depth &&
+            std::hypot(
+            calib.fx() * P.x() / P.z() + calib.cx() - obs->second.x,
+            calib.fy() * P.y() / P.z() + calib.cy() - obs->second.y) < p.max_window_reproj_px;
+        }
+        if (consistent) {
+          w.landmark.emplace(lm.first, X);
+          ++w.window_triangulated;
+        }
+      }
+    }
   }
 
   w.valid = w.pose.size() >= 5;

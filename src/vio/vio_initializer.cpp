@@ -91,6 +91,13 @@ bool VioInitializer::align(
     out.frames.push_back(entry.first);
   }
   std::sort(out.frames.begin(), out.frames.end());
+  if (p_.align_stride > 1) {   // every Nth posed frame: longer intervals, see InitializerParams
+    std::vector<int> kept;
+    for (std::size_t i = 0; i < out.frames.size(); i += static_cast<std::size_t>(p_.align_stride)) {
+      kept.push_back(out.frames[i]);
+    }
+    out.frames = std::move(kept);
+  }
   const int n = static_cast<int>(out.frames.size());
   if (n < 3) {
     return false;
@@ -331,7 +338,7 @@ InitResult VioInitializer::run(
     return out;
   }
   if (p_.sfm_bundle_adjust) {
-    out.sfm_ba = bundleAdjust(frames, out.sfm, calib_);
+    out.sfm_ba = bundleAdjust(frames, out.sfm, calib_, 10, 2.0, p_.sfm_ba_fix_pair);
   }
   if (p_.oracle_sfm) {
     p_.oracle_sfm(frames, out.sfm);

@@ -82,6 +82,14 @@ struct InitializerParams
   /// alignment's scale collapse was traced to the PnP-propagated translations (doc/08 §6).
   /// (estimator_check --no-sfm-ba to compare.)
   bool sfm_bundle_adjust = true;
+  /// Hold the base pair's partner fixed in that adjustment (VINS-Fusion), or only the base.
+  bool sfm_ba_fix_pair = true;
+  /// [4] Align over every Nth posed frame. Over one 50 ms frame interval the accelerometer moves
+  /// the body ~1 mm while the reconstruction's position noise is larger, and a least-squares fit
+  /// of s against noisy position increments is biased toward ZERO (errors-in-variables).
+  /// VINS-Fusion and ORB-SLAM3 align between parallax-spaced keyframes. (estimator_check
+  /// --align-stride=N.)
+  int align_stride = 1;
   /// TEST-ONLY. Called on the reconstruction between stages [2] and [4]; may overwrite its poses
   /// (estimator_check --oracle-sfm substitutes ground truth). Unset in the node.
   std::function<void(const std::vector<SfmFrame> &, SfmWindow &)> oracle_sfm;

@@ -27,7 +27,7 @@ struct Obs
 
 SfmBundleStats bundleAdjust(
   const std::vector<SfmFrame> & frames, SfmWindow & w, const CameraCalib & calib,
-  int max_iterations, double huber_delta_px)
+  int max_iterations, double huber_delta_px, bool fix_pair_frame)
 {
   SfmBundleStats stats;
   if (w.second < 0 || !w.pose.count(w.base) || !w.pose.count(w.second)) {
@@ -52,7 +52,7 @@ SfmBundleStats bundleAdjust(
   std::sort(frame_ids.begin(), frame_ids.end());
   std::unordered_map<int, int> free_index;
   for (int k : frame_ids) {
-    if (k != w.base && k != w.second) {
+    if (k != w.base && (k != w.second || !fix_pair_frame)) {
       const int i = static_cast<int>(free_index.size());
       free_index.emplace(k, i);
     }
@@ -225,6 +225,20 @@ SfmBundleStats bundleAdjust(
       if (lambda > 1e6) {
         break;
       }
+    }
+  }
+
+  // Free pair frame: the scale was left to the damping, so restore the ruler -- the pair's
+  // distance from the base (which sits at the origin) -- by scaling about the origin.
+  const double pair_before = w.pose.at(w.second).inverse().translation().norm();
+  const double pair_after = x.at(w.second).p.norm();
+  if (!fix_pair_frame && pair_after > 1e-12) {
+    const double k = pair_before / pair_after;
+    for (auto & kv : x) {
+      kv.second.p *= k;
+    }
+    for (auto & Xl : X) {
+      Xl *= k;
     }
   }
 
