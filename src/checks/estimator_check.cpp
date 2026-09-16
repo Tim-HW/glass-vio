@@ -117,6 +117,9 @@ int main(int argc, char ** argv)
   //   --no-forget     the window keeps its views of a landmark the map dropped as an outlier
   //   --init-log      one line per bootstrap attempt: the stage that refused, and its numbers
   //   --sfm-window=N  frames the bootstrap reconstructs and aligns over (the node uses 30)
+  //   --refine-gravity  the alignment fixes |g| and re-solves gravity's direction (VINS-Fusion)
+  //   --oracle-sfm=rot|pos|both  the bootstrap reconstruction's rotations and/or positions from
+  //                   ground truth, in the reconstruction's own ruler -- is stage [4] fed badly?
   //   --fast=N        the tracker's FAST corner threshold (default 20)
   //   --window-outlier-px=PX  the window drops observations more than PX off before solving
   std::vector<std::string> pos;
@@ -142,6 +145,8 @@ int main(int argc, char ** argv)
   bool init_log = false;
   int fast_threshold = 20;
   int sfm_window = 0;   // 0 = the initializer default
+  bool refine_gravity = false;
+  std::string oracle_sfm;   // "", "rot", "pos" or "both"
   double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
   bool report_only = false;
@@ -217,6 +222,13 @@ int main(int argc, char ** argv)
         no_forget = true;
       } else if (a == "--init-log") {
         init_log = true;
+      } else if (a.rfind("--oracle-sfm=", 0) == 0) {
+        oracle_sfm = a.substr(13);
+        if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
+          throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
+        }
+      } else if (a == "--refine-gravity") {
+        refine_gravity = true;
       } else if (a.rfind("--sfm-window=", 0) == 0) {
         sfm_window = static_cast<int>(nonnegativeNumber(a.substr(13)));
       } else if (a.rfind("--fast=", 0) == 0) {
@@ -315,6 +327,7 @@ int main(int argc, char ** argv)
   if (sfm_window > 0) {
     ep.init.window_frames = sfm_window;
   }
+  ep.init.refine_gravity = refine_gravity;
   if (window_outlier_px >= 0.0) {
     ep.window.outlier_px = window_outlier_px;
   }
@@ -389,6 +402,34 @@ int main(int argc, char ** argv)
         }
         T_world_body = T_align.inverse() * bag.gt.at(t);
         return true;
+      };
+  }
+  if (!oracle_sfm.empty()) {
+    const bool sub_rot = oracle_sfm != "pos";
+    const bool sub_pos = oracle_sfm != "rot";
+    ep.init.oracle_sfm = [&, sub_rot, sub_pos](
+      const std::vector<glassvio::SfmFrame> & fr, glassvio::SfmWindow & w) {
+        if (w.second < 0 || !w.pose.count(w.second)) {
+          return;
+        }
+        const Eigen::Isometry3d T_ci = calib.T_cam_imu;
+        const auto truth_c0_ck = [&](int k) -> Eigen::Isometry3d {   // metric
+            return T_ci * bag.gt.at(fr[w.base].t).inverse() * bag.gt.at(fr[k].t) * T_ci.inverse();
+          };
+        // Keep the reconstruction's ruler: metres per unit, fixed by its own base pair.
+        const double ruler = truth_c0_ck(w.second).translation().norm() /
+          std::max(1e-9, w.pose.at(w.second).inverse().translation().norm());
+        for (auto & kv : w.pose) {
+          Eigen::Isometry3d T = kv.second.inverse();   // T_c0_ck, ruler units
+          const Eigen::Isometry3d G = truth_c0_ck(kv.first);
+          if (sub_rot) {
+            T.linear() = G.linear();
+          }
+          if (sub_pos) {
+            T.translation() = G.translation() / ruler;
+          }
+          kv.second = T.inverse();
+        }
       };
   }
   glassvio::VioEstimator est(calib, ep);

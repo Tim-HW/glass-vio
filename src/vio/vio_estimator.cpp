@@ -91,7 +91,7 @@ bool VioEstimator::bootstrap()
   // FromTwoVectors gives the MINIMAL rotation, which is exactly right for the same reason
   // ImuInit uses it: there is no information to determine the third axis, so do not invent it.
   const Eigen::Quaterniond q = Eigen::Quaterniond::FromTwoVectors(
-    r.gravity_sfm.normalized(), Eigen::Vector3d(0.0, 0.0, -1.0));
+    r.gravity_refined.normalized(), Eigen::Vector3d(0.0, 0.0, -1.0));
   Eigen::Isometry3d T_world_c0 = Eigen::Isometry3d::Identity();
   T_world_c0.linear() = q.normalized().toRotationMatrix();
 

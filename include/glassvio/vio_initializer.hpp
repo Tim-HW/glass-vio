@@ -1,6 +1,7 @@
 #ifndef GLASSVIO_VIO_INITIALIZER_HPP
 #define GLASSVIO_VIO_INITIALIZER_HPP
 
+#include <functional>
 #include <vector>
 
 #include <Eigen/Core>
@@ -71,6 +72,14 @@ struct InitializerParams
   /// otherwise the solve falls back to `accel_bias`.
   bool estimate_accel_bias = true;
   double max_accel_bias_std = 0.1;
+  /// After |g| passes max_gravity_error_pct, fix it at kGravity and re-solve with gravity as two
+  /// tangent coordinates (VINS-Fusion's RefineGravity). Off: measured, it helped V1_02 and hurt
+  /// V1_01 and V1_03, and did not cure the scale collapse -- the SfM positions cause that
+  /// (doc/08 §6). Worth re-measuring once the reconstruction is bundle-adjusted.
+  bool refine_gravity = false;
+  /// TEST-ONLY. Called on the reconstruction between stages [2] and [4]; may overwrite its poses
+  /// (estimator_check --oracle-sfm substitutes ground truth). Unset in the node.
+  std::function<void(const std::vector<SfmFrame> &, SfmWindow &)> oracle_sfm;
 };
 
 /// What the bootstrap produced. Everything spatial is in the SFM FRAME -- the base camera --
@@ -95,6 +104,8 @@ struct InitResult
   Eigen::Vector3d gyro_bias = Eigen::Vector3d::Zero();
   /// [4] m/s^2, in the SfM frame. Its MAGNITUDE is the oracle -- nothing told the solve.
   Eigen::Vector3d gravity_sfm = Eigen::Vector3d::Zero();
+  /// [4] gravity after the fixed-|g| refinement (= gravity_sfm when refine_gravity is off).
+  Eigen::Vector3d gravity_refined = Eigen::Vector3d::Zero();
   /// [4] metres per ruler unit: what the base pair's invented |t| = 1 was really worth.
   double scale = 0.0;
   /// Marginal RELATIVE uncertainty of the scale, sigma_s / |s|. Large = scale poorly excited =

@@ -421,9 +421,45 @@ numbers, and — against ground truth, scale-free — how wrong the reconstructi
   A longer window (`--sfm-window=30/40`) is not the fix: it moves V1_03's bootstrap to 58 s with a
   1.8× speed error that the 0.06 gate *accepted*.
 
-**So what is next** is the alignment's scale: why good reconstructions give s → 0, and why even
-accepted ones sit ~10% low. Oracle substitution again — ground-truth rotations or positions into
-stage [4] — says whether it is the SfM input or the alignment itself.
+**How the state of the art does it.** VINS-Fusion, ORB-SLAM3 and OpenVINS all reach 2–7 cm RMS
+ATE on these rooms (ORB-SLAM3's Table II, monocular-inertial: V1_01/02/03 0.049/0.015/0.037 m;
+VINS-Mono 0.047/0.066/0.180). Scored the same way — SE(3)-aligned RMS ATE — glassvio is 0.095 m on
+V1_01 from its 15 s bootstrap, 0.32 m on V1_02 and 0.62 m on V1_03. The design difference that
+matters here: **none of them demands a right scale from one 1 s linear solve.** VINS-Fusion keeps
+10 parallax-spaced keyframes, asks the SfM for 20 shared tracks and then *bundle-adjusts* the
+window, checks only s > 0, and refines gravity with |g| fixed. ORB-SLAM3 builds 2 s of visual map,
+runs a nonlinear inertial optimization and re-estimates scale at 5 s, 15 s and every 10 s to 75 s.
+OpenVINS constrains |g| in its linear solve and refines by MLE.
+
+**Gravity with |g| fixed — built, measured, off.** VINS-Fusion's RefineGravity: once the free |g| passes
+the oracle check, fix it at 9.81 and re-solve with gravity as two tangent coordinates
+(`InitializerParams::refine_gravity`, `--refine-gravity`). The bootstrap it accepts can be
+metrically better — V1_02's starting speed ratio 0.81 → 1.01 — but it does *not* cure the collapse
+(refused windows still solve s ≈ 0.02–0.06× the truth), and downstream it hurt two sequences of
+three: V1_01's median error 0.36 → 0.53 m, V1_03 failing at 47.5 s. Off until the reconstruction
+below is fixed; then it is worth measuring again.
+
+| FAST 20 | V1_01 | V1_02 | V1_03 |
+|---|---|---|---|
+| **free \|g\| (default): bootstrap · first >1 m · ATE** | 15.4 s · never · 0.095 m | 32.9 s · 74.2 s · 0.316 m | 44.4 s · 97.0 s · 0.618 m |
+| \|g\| fixed (`--refine-gravity`) | 12.4 s · never · 0.119 m | 32.9 s · never · 0.221 m | 44.4 s · 47.5 s · 0.837 m |
+
+**The collapse is the reconstruction's positions — measured by substitution.** `--oracle-sfm`
+replaces the reconstruction's rotations and/or positions with ground truth, in its own ruler, just
+before stage [4]:
+
+| `--oracle-sfm` | V1_02 bootstrap · s / s_true | V1_03 bootstrap · s / s_true |
+|---|---|---|
+| none | 32.9 s · median 0.02 over 58 windows | 44.4 s · median 0.02 over 20 windows |
+| `rot` | 32.9 s · median 0.02 | 44.4 s · median 0.03 |
+| `pos` | **7.4 s · 1.10**, the first window through | **13.4 s · 0.91**, the first window through |
+
+True rotations change nothing; true positions bootstrap on the first window that reaches the
+alignment. The alignment is sound — it is being fed translations (4–8° off in direction, propagated
+frame to frame by PnP) that no metric trajectory fits.
+
+**So what is next** is the step VINS-Fusion runs and glassvio skips: bundle-adjust the reconstruction
+window — poses and landmarks, reprojection only — before stage [4].
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -531,7 +567,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--window-tri] [--no-map-tri] [--gravity] [--gravity-sigma=DEG] \
                                  [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp] \
                                  [--no-forget] [--window-outlier-px=PX] [--no-recycle] \
-                                 [--init-log] [--fast=N] [--sfm-window=N]
+                                 [--init-log] [--fast=N] [--sfm-window=N] \
+                                 [--refine-gravity] [--oracle-sfm=rot|pos|both]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

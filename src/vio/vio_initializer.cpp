@@ -182,11 +182,11 @@ bool VioInitializer::align(
     double sigma2 = 0.0;
     Eigen::MatrixXd N_inv;
   };
-  const auto solve = [&](int cols) -> Solution {
-      const Eigen::MatrixXd Ak = A.leftCols(cols);
+  const auto solve = [&](const Eigen::MatrixXd & Ak, const Eigen::VectorXd & bk) -> Solution {
       Solution s;
-      s.x = Ak.colPivHouseholderQr().solve(b);
-      s.sigma2 = (Ak * s.x - b).squaredNorm() / static_cast<double>(std::max(1, row - cols));
+      s.x = Ak.colPivHouseholderQr().solve(bk);
+      s.sigma2 = (Ak * s.x - bk).squaredNorm() /
+        static_cast<double>(std::max<Eigen::Index>(1, Ak.rows() - Ak.cols()));
       s.N_inv = (Ak.transpose() * Ak).inverse();
       return s;
     };
@@ -201,7 +201,7 @@ bool VioInitializer::align(
   out.accel_bias_estimated = false;
   out.accel_bias_std = 0.0;
   if (p_.estimate_accel_bias) {
-    sol = solve(dim_ba);
+    sol = solve(A.leftCols(dim_ba), b);
     out.accel_bias_std = std::sqrt(
       std::max(0.0, sol.sigma2 * sol.N_inv.diagonal().segment<3>(bai).maxCoeff()));
     if (sol.x.allFinite() && out.accel_bias_std < p_.max_accel_bias_std) {
@@ -210,15 +210,65 @@ bool VioInitializer::align(
     }
   }
   if (!out.accel_bias_estimated) {
-    sol = solve(dim);
+    sol = solve(A.leftCols(dim), b);
   }
-  const Eigen::VectorXd & x = sol.x;
-  if (!x.allFinite()) {
+  if (!sol.x.allFinite()) {
     return false;
   }
 
-  out.gravity_sfm = x.segment<3>(gi);
-  out.scale = x(si);
+  // THE ORACLE. |g| entered the solve as three free numbers -- nothing told it what gravity
+  // weighs. If the formulation, the frames or the extrinsic were wrong there is no reason
+  // for its magnitude to land near 9.80665, so this is a genuine test rather than a
+  // tautology. It is also the ONLY self-check available without ground truth. So it judges the
+  // FREE solve, before the refinement below takes the freedom away.
+  const Eigen::Vector3d g_free = sol.x.segment<3>(gi);
+  const double g_err = std::abs(g_free.norm() - kGravity) / kGravity;
+  if (g_err > p_.max_gravity_error_pct / 100.0) {
+    return false;
+  }
+
+  // GRAVITY REFINEMENT -- VINS-Fusion's RefineGravity. A free |g| is a direction the solve can
+  // trade against s: shrink the scale, tilt and stretch gravity, and the dv rows still fit. Once
+  // |g| has passed the oracle, fix it at kGravity and re-solve with gravity as TWO tangent
+  // coordinates around the current estimate, relinearising a few times (VINS: 4). The unknown
+  // it removes is exactly the one scale was leaning on. OpenVINS constrains |g| in its linear
+  // solve and ORB-SLAM3 optimizes gravity's direction only; nobody else leaves the weight free.
+  // Off by default -- measured mixed (doc/08 §6); estimator_check --refine-gravity to compare.
+  const int cols = out.accel_bias_estimated ? dim_ba : dim;
+  int s_idx = si;
+  int ba_idx = bai;
+  Eigen::Vector3d g = g_free;
+  if (p_.refine_gravity) {
+    g = g_free.normalized() * kGravity;
+    const Eigen::MatrixXd rest = A.middleCols(gi + 3, cols - gi - 3);   // s, and db_a if kept
+    for (int it = 0; it < 4; ++it) {
+      const Eigen::Vector3d u = g.normalized();
+      const Eigen::Vector3d seed =
+        std::abs(u.z()) < 0.9 ? Eigen::Vector3d::UnitZ() : Eigen::Vector3d::UnitX();
+      Eigen::Matrix<double, 3, 2> B;
+      B.col(0) = (seed - u * u.dot(seed)).normalized();
+      B.col(1) = u.cross(B.col(0));
+
+      Eigen::MatrixXd Ar(row, cols - 1);
+      Ar << A.leftCols(gi), A.middleCols(gi, 3) * B, rest;
+      const Eigen::VectorXd br = b - A.middleCols(gi, 3) * g;
+      sol = solve(Ar, br);
+      if (!sol.x.allFinite()) {
+        return false;
+      }
+      g = (g + B * sol.x.segment<2>(gi)).normalized() * kGravity;
+    }
+    s_idx = gi + 2;
+    ba_idx = gi + 3;
+  }
+  const Eigen::VectorXd & x = sol.x;
+  if (out.accel_bias_estimated) {
+    out.accel_bias = p_.accel_bias + x.segment<3>(ba_idx);
+  }
+
+  out.gravity_sfm = g_free;   // the free estimate, so |g| stays the oracle a caller can read
+  out.gravity_refined = g;
+  out.scale = x(s_idx);
 
   // SCALE OBSERVABILITY, the SUFFICIENT test the sign check is not. Scale reaches the solve
   // only through the accelerometer's non-gravity part, so a window without excitation leaves s
@@ -231,21 +281,12 @@ bool VioInitializer::align(
   // the exact ridge that lets a bad window fake a fit. Dimensionless, so it needs no
   // per-dataset threshold. The raw condition number of A does NOT work here: its columns span
   // dt, dt^2 and ruler units, so its conditioning measures column scaling, not observability.
-  const double var_s = sol.sigma2 * sol.N_inv(si, si);
+  const double var_s = sol.sigma2 * sol.N_inv(s_idx, s_idx);
   out.scale_uncertainty =
     std::sqrt(std::max(0.0, var_s)) / std::max(std::abs(out.scale), 1e-9);
   out.velocity_sfm.clear();
   for (int a = 0; a < n; ++a) {
     out.velocity_sfm.push_back(x.segment<3>(3 * a));
-  }
-
-  // THE ORACLE. |g| entered the solve as three free numbers -- nothing told it what gravity
-  // weighs. If the formulation, the frames or the extrinsic were wrong there is no reason
-  // for its magnitude to land near 9.80665, so this is a genuine test rather than a
-  // tautology. It is also the ONLY self-check available without ground truth.
-  const double g_err = std::abs(out.gravity_sfm.norm() - kGravity) / kGravity;
-  if (g_err > p_.max_gravity_error_pct / 100.0) {
-    return false;
   }
 
   // Scale observability.
@@ -288,6 +329,9 @@ InitResult VioInitializer::run(
   out.sfm = reconstruct(frames, begin);
   if (!out.sfm.valid) {
     return out;
+  }
+  if (p_.oracle_sfm) {
+    p_.oracle_sfm(frames, out.sfm);
   }
 
   // [3] Gyro bias. Rotations are scale-free, so this is observable before the metre exists
