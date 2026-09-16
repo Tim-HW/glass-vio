@@ -44,7 +44,8 @@ add_library(vio
   src/vio/visual_registration.cpp
   src/vio/vio_estimator.cpp
   src/vio/landmark_map.cpp
-  src/vio/keyframe_window.cpp)
+  src/vio/keyframe_window.cpp
+  src/vio/sfm_bundle.cpp)
 target_include_directories(vio PUBLIC include)
 ament_target_dependencies(vio
   rclcpp sensor_msgs geometry_msgs rosbag2_cpp cv_bridge OpenCV)
@@ -156,6 +157,14 @@ if(BUILD_TESTING)
     rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
   target_link_libraries(test_keyframe_window vio)
   add_test(NAME test_keyframe_window COMMAND test_keyframe_window)
+
+  add_executable(test_sfm_bundle test/test_sfm_bundle.cpp)
+  target_include_directories(test_sfm_bundle PRIVATE include)
+  target_compile_options(test_sfm_bundle PRIVATE -UNDEBUG)
+  ament_target_dependencies(test_sfm_bundle
+    rosbag2_cpp sensor_msgs geometry_msgs cv_bridge OpenCV)
+  target_link_libraries(test_sfm_bundle vio)
+  add_test(NAME test_sfm_bundle COMMAND test_sfm_bundle)
 
   add_executable(test_measurements test/test_measurements.cpp)
   target_include_directories(test_measurements PRIVATE include)

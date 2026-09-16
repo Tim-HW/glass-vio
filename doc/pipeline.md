@@ -93,8 +93,8 @@ V1_01:
 |---|---|
 | [1] Feature tracking | ✅ FAST + KLT, persistent ids, radtan undistortion at the boundary. |
 | [2] Sync | ✅ Working; IMU spliced across dropped frames. |
-| [3] Bootstrap | ✅ Metric scale via the observability gate — 1.62 m landmark depth, gyro bias to ~2%. |
-| [4] Track | ✅ Tight solve + sliding-window map, plus Stage A's keyframe-window bundle adjustment and an inlier gate on every tracker solve. Tracks V1_01 from its 15 s bootstrap to the end of the ground truth at metric scale (speed ratio 1.00), median drift 0.36 m, never above 1 m; the faster V1_02 and V1_03 first pass 1 m at 74 s and 97 s. |
+| [3] Bootstrap | ✅ SfM bundle-adjusted before a linear visual-inertial alignment, gated on scale observability; bootstraps at 15 / 17 / 34 s on V1_01 / V1_02 / V1_03. |
+| [4] Track | ✅ Tight solve + sliding-window map, plus Stage A's keyframe-window bundle adjustment and an inlier gate on every tracker solve. Tracks EuRoC V1_01, V1_02 and V1_03 from bootstrap (15 / 17 / 34 s) to the end of the ground truth at metric scale, never above 1 m; RMS ATE 0.11 / 0.16 / 0.25 m. |
 
 The offline thesis check `vio_check` is **0.036 m**; the unit suites are green. **Two residuals
 remain** ([Module 8](08-sliding-window.md)): a ~20% scale shrink and a fast-motion divergence. Traced

@@ -330,6 +330,9 @@ InitResult VioInitializer::run(
   if (!out.sfm.valid) {
     return out;
   }
+  if (p_.sfm_bundle_adjust) {
+    out.sfm_ba = bundleAdjust(frames, out.sfm, calib_);
+  }
   if (p_.oracle_sfm) {
     p_.oracle_sfm(frames, out.sfm);
   }

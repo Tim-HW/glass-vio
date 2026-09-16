@@ -12,6 +12,8 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 
+#include "sophus/so3.hpp"
+
 #include "glassvio/camera_calib.hpp"
 
 namespace glassvio

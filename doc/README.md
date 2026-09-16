@@ -81,5 +81,5 @@ reconstruction (scale, gravity, velocity). Then it **tracks**: a camera reprojec
 an IMU factor in the *same* `NormalEquationsN<15>` glass-lio's LiDAR path uses, over a
 sliding-window landmark map — and every few frames a keyframe window re-solves the recent poses
 *jointly with the landmarks*, which is what lets the IMU hold the map at metric scale. It tracks
-EuRoC V1_01 to the end of its ground truth at 0.36 m median drift; [Module 8](08-sliding-window.md) is how the scale loss
+EuRoC V1_01–V1_03 to the end of their ground truth at 0.11–0.25 m RMS ATE; [Module 8](08-sliding-window.md) is how the scale loss
 it fixes was traced, and what is still open.

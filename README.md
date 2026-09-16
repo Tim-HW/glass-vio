@@ -31,11 +31,11 @@ lab behind every claim.
 
 ## Status
 
-**A working monocular VIO**, measured on EuRoC V1_01 by the deterministic harness
+**A working monocular VIO**, measured on EuRoC V1_01–V1_03 by the deterministic harness
 (`estimator_check`, which also gates CI with explicit thresholds):
 
 - **Front end** — FAST + KLT tracking with persistent ids, points undistorted at the boundary.
-- **Bootstrap** — up-to-scale SfM, the gyro bias from vision's rotations, and a linear
+- **Bootstrap** — up-to-scale SfM refined by bundle adjustment, the gyro bias from vision's rotations, and a linear
   visual-inertial alignment gated on scale observability: a metric start, no static window.
 - **Tracking** — a camera reprojection residual and the IMU preintegration factor in one 15-DoF
   Gauss-Newton solve against a sliding landmark map.
@@ -43,8 +43,8 @@ lab behind every claim.
   of ORB-SLAM3's local inertial BA. This is what holds the metric scale (speed ratio 1.02; 0.78
   without it).
 
-It tracks EuRoC V1_01 from its bootstrap to the end of the ground truth at 0.36 m median error,
-never passing 1 m; the faster V1_02 and V1_03 hold to 74 s and 97 s.
+It tracks EuRoC V1_01, V1_02 and V1_03 from bootstrap to the end of the ground truth without the
+error ever passing 1 m (RMS ATE 0.11 / 0.16 / 0.25 m).
 Odometry only — no
 loop closure. What is still open (the accel bias, gravity's tilt, the fast-motion sections) and how
 each was measured is in [doc/08-sliding-window.md](doc/08-sliding-window.md).

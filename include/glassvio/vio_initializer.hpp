@@ -12,6 +12,7 @@
 #include "glass_core/preintegration.hpp"
 #include "glassvio/dataset.hpp"
 #include "glassvio/camera_calib.hpp"
+#include "glassvio/sfm_bundle.hpp"
 #include "glassvio/sfm_window.hpp"
 
 namespace glassvio
@@ -77,6 +78,10 @@ struct InitializerParams
   /// V1_01 and V1_03, and did not cure the scale collapse -- the SfM positions cause that
   /// (doc/08 §6). Worth re-measuring once the reconstruction is bundle-adjusted.
   bool refine_gravity = false;
+  /// [2] Bundle-adjust the reconstruction (poses + landmarks, reprojection) before [4]. The
+  /// alignment's scale collapse was traced to the PnP-propagated translations (doc/08 §6).
+  /// (estimator_check --no-sfm-ba to compare.)
+  bool sfm_bundle_adjust = true;
   /// TEST-ONLY. Called on the reconstruction between stages [2] and [4]; may overwrite its poses
   /// (estimator_check --oracle-sfm substitutes ground truth). Unset in the node.
   std::function<void(const std::vector<SfmFrame> &, SfmWindow &)> oracle_sfm;
@@ -100,6 +105,7 @@ struct InitResult
 
   /// [2]
   SfmWindow sfm;
+  SfmBundleStats sfm_ba;   ///< [2] what the bundle adjustment did, when it ran
   /// [3] rad/s, body frame.
   Eigen::Vector3d gyro_bias = Eigen::Vector3d::Zero();
   /// [4] m/s^2, in the SfM frame. Its MAGNITUDE is the oracle -- nothing told the solve.

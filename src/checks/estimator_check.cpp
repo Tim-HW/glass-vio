@@ -118,6 +118,7 @@ int main(int argc, char ** argv)
   //   --init-log      one line per bootstrap attempt: the stage that refused, and its numbers
   //   --sfm-window=N  frames the bootstrap reconstructs and aligns over (the node uses 30)
   //   --refine-gravity  the alignment fixes |g| and re-solves gravity's direction (VINS-Fusion)
+  //   --no-sfm-ba     the bootstrap reconstruction goes to the alignment without bundle adjustment
   //   --oracle-sfm=rot|pos|both  the bootstrap reconstruction's rotations and/or positions from
   //                   ground truth, in the reconstruction's own ruler -- is stage [4] fed badly?
   //   --fast=N        the tracker's FAST corner threshold (default 20)
@@ -146,6 +147,7 @@ int main(int argc, char ** argv)
   int fast_threshold = 20;
   int sfm_window = 0;   // 0 = the initializer default
   bool refine_gravity = false;
+  bool no_sfm_ba = false;
   std::string oracle_sfm;   // "", "rot", "pos" or "both"
   double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
@@ -227,6 +229,8 @@ int main(int argc, char ** argv)
         if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
           throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
         }
+      } else if (a == "--no-sfm-ba") {
+        no_sfm_ba = true;
       } else if (a == "--refine-gravity") {
         refine_gravity = true;
       } else if (a.rfind("--sfm-window=", 0) == 0) {
@@ -328,6 +332,7 @@ int main(int argc, char ** argv)
     ep.init.window_frames = sfm_window;
   }
   ep.init.refine_gravity = refine_gravity;
+  ep.init.sfm_bundle_adjust = !no_sfm_ba;
   if (window_outlier_px >= 0.0) {
     ep.window.outlier_px = window_outlier_px;
   }
@@ -458,9 +463,10 @@ int main(int argc, char ** argv)
       const glassvio::InitResult & ir = est.lastInit();
       std::printf(
         "init %6.2f s  shared %3d cand %2d best_lm %3d lm %3zu pairs %3d intervals %3d "
-        "|g| err %5.2f%% s %.4f sigma_s/s %.3f ba_std %.2f  %s\n",
+        "sfm_ba %.2f->%.2f px |g| err %5.2f%% s %.4f sigma_s/s %.3f ba_std %.2f  %s\n",
         f.t - t0, ir.sfm.max_shared, ir.sfm.candidates_tried, ir.sfm.max_trial_landmarks,
-        ir.sfm.landmark.size(), ir.bias_pairs, ir.align_intervals,
+        ir.sfm.landmark.size(), ir.bias_pairs, ir.align_intervals, ir.sfm_ba.median_px_before,
+        ir.sfm_ba.median_px_after,
         100.0 * std::abs(ir.gravity_sfm.norm() - 9.80665) / 9.80665, ir.scale,
         ir.scale_uncertainty, ir.accel_bias_std,
         est.lastFailure().empty() ? "OK" : est.lastFailure().c_str());

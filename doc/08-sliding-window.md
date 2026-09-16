@@ -25,12 +25,13 @@ the offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
 
 | metric | per-frame tracker alone | **today's default** (§6) |
 |---|---|---|
-| bootstrap landmark depth | 1.62 m (true room scale) | 2.01 m (a later bootstrap window: §6) |
+| bootstrap landmark depth | 1.62 m (true room scale) | 1.89 m (a later bootstrap window: §6) |
 | velocity accuracy $\lVert\mathbf{v}\rVert_{\text{est}}/\lVert\mathbf{v}\rVert_{\text{gt}}$ | ~0.78 | **~1.00** |
-| tracked | ~29 s | **129 s** — from the 15.4 s bootstrap to the end of the ground truth |
-| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.36 m** (over 129 s) |
-| error first passed 1 m | — | **never** — at every tracker gate, with the true bias, with gravity re-estimated (§6) |
-| V1_02_medium / V1_03_difficult, first >1 m | — | 74.2 s / 97.0 s (§6) |
+| tracked | ~29 s | **130 s** — from the 14.7 s bootstrap to the end of the ground truth |
+| median position drift (aligned to GT at bootstrap) | 0.65 m | **0.40 m** (over 130 s) |
+| RMS ATE (SE(3)-aligned, the way papers report it) | — | **0.106 m** |
+| error first passed 1 m | — | **never** (§6) |
+| V1_02_medium / V1_03_difficult: bootstrap · first >1 m · RMS ATE | — | 16.9 s · never · 0.161 m / 33.6 s · never · 0.254 m |
 
 §2–§5 are the story of the left column — how its drift was traced. §6 is the right column.
 
@@ -458,8 +459,38 @@ True rotations change nothing; true positions bootstrap on the first window that
 alignment. The alignment is sound — it is being fed translations (4–8° off in direction, propagated
 frame to frame by PnP) that no metric trajectory fits.
 
-**So what is next** is the step VINS-Fusion runs and glassvio skips: bundle-adjust the reconstruction
-window — poses and landmarks, reprojection only — before stage [4].
+**Bundle-adjusting the reconstruction — built, measured, on.** `bundleAdjust`
+([`sfm_bundle.cpp`](../src/vio/sfm_bundle.cpp)) is VINS-Fusion's GlobalSFM step: every posed frame
+and every landmark of the window, jointly, on Huber-weighted reprojection error, Levenberg-Marquardt
+with each landmark eliminated by its own 3×3 Schur block. The base frame and its base-pair partner
+stay fixed — the similarity gauge, and the ruler stage [4]'s s is measured in. It adds no new
+derivative: each camera is a `NavState` whose "IMU" is the camera itself (identity extrinsic), so the
+residual and Jacobians are the reprojection factor's, already pinned by finite differences.
+`test_sfm_bundle` pins the solver: exact pixels, perturbed poses and points, 8.5 px → 1e-5 px, gauge
+frames untouched, free poses back within 2e-8 rad.
+
+| default, before → after (`--no-sfm-ba` to compare) | V1_01 | V1_02 | V1_03 |
+|---|---|---|---|
+| bootstrap | 15.4 → 14.7 s | 32.9 → **16.9 s** | 44.4 → **33.6 s** |
+| first >1 m | never → never | 74.2 s → **never** | 97.0 s → **never** |
+| RMS ATE (SE(3)) | 0.095 → 0.106 m | 0.316 → **0.161 m** | 0.618 → **0.254 m** |
+| harness regression | pass → pass | fail → **pass** | pass → pass |
+
+It is not the whole of the substitution's gain. Windows reaching the alignment still mostly solve a
+collapsed scale (median 0.02–0.06× the truth), and the bootstraps it lets through start ~20% slow
+(speed ratio 0.78–0.82) for the keyframe window to correct. The reprojection error it removes is
+small — a median 0.5 → 0.45 px — which says the translation error is largely *consistent with the
+pixels*: weak structure over a short baseline, not noise. VINS-Fusion also triangulates every track
+across the whole window before its bundle adjustment; this reconstruction still has only the base
+pair's landmarks. And `--refine-gravity` on top made it worse again (V1_02 first >1 m at 18.6 s), so
+that stays off.
+
+**Against the state of the art** (RMS ATE, V1_01/02/03): glassvio 0.106 / 0.161 / 0.254 m — VINS-Mono
+0.047 / 0.066 / 0.180, ORB-SLAM3 0.049 / 0.015 / 0.037 — now tracking all three to the end.
+
+**So what is next:** the bootstrap is still slow and still starts ~20% off in scale — triangulate the
+whole window's tracks before the bundle adjustment, as VINS-Fusion does — and the remaining 2–3× in
+ATE.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -568,7 +599,7 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--inlier-fraction=F] [--no-refused-insert] [--coast-on-pnp] \
                                  [--no-forget] [--window-outlier-px=PX] [--no-recycle] \
                                  [--init-log] [--fast=N] [--sfm-window=N] \
-                                 [--refine-gravity] [--oracle-sfm=rot|pos|both]
+                                 [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker
