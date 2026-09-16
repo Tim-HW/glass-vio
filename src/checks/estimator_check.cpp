@@ -122,6 +122,9 @@ int main(int argc, char ** argv)
   //   --sfm-tri       the bootstrap reconstruction also triangulates the rest of the window's tracks
   //   --sfm-ba-free-pair  that adjustment fixes only the base frame, not the base pair's partner
   //   --align-stride=N  the alignment uses every Nth posed frame (longer IMU intervals)
+  //   --max-scale-unc=X  the bootstrap's scale gate, sigma_s/s (default 0.06)
+  //   --visual-init=S  track vision-only after an unobservable alignment, realign over keyframes
+  //                   from S seconds on (ORB-SLAM3's start; 0 = off)
   //   --oracle-sfm=rot|pos|both  the bootstrap reconstruction's rotations and/or positions from
   //                   ground truth, in the reconstruction's own ruler -- is stage [4] fed badly?
   //   --fast=N        the tracker's FAST corner threshold (default 20)
@@ -154,6 +157,8 @@ int main(int argc, char ** argv)
   bool sfm_tri = false;
   bool sfm_ba_free_pair = false;
   int align_stride = 0;   // 0 = the default
+  double max_scale_unc = -1.0;   // < 0 = the default
+  double visual_init = -1.0;   // < 0 = the default
   std::string oracle_sfm;   // "", "rot", "pos" or "both"
   double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
@@ -235,6 +240,10 @@ int main(int argc, char ** argv)
         if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
           throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
         }
+      } else if (a.rfind("--visual-init=", 0) == 0) {
+        visual_init = nonnegativeNumber(a.substr(14));
+      } else if (a.rfind("--max-scale-unc=", 0) == 0) {
+        max_scale_unc = nonnegativeNumber(a.substr(16));
       } else if (a.rfind("--align-stride=", 0) == 0) {
         align_stride = nonnegativeInteger(a.substr(15));
       } else if (a == "--sfm-ba-free-pair") {
@@ -349,6 +358,12 @@ int main(int argc, char ** argv)
   ep.init.sfm_ba_fix_pair = !sfm_ba_free_pair;
   if (align_stride > 0) {
     ep.init.align_stride = align_stride;
+  }
+  if (visual_init >= 0.0) {
+    ep.visual_init_seconds = visual_init;
+  }
+  if (max_scale_unc >= 0.0) {
+    ep.init.max_scale_uncertainty = max_scale_unc;
   }
   if (window_outlier_px >= 0.0) {
     ep.window.outlier_px = window_outlier_px;

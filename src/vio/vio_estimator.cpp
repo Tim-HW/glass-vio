@@ -35,6 +35,9 @@ void VioEstimator::reset()
   x_ = NavState();
   P_.setZero();
   t_prev_ = 0.0;
+  vis_active_ = false;
+  vis_frames_.clear();
+  vis_sfm_ = SfmWindow();
 }
 
 // =================================================================================
@@ -84,9 +87,21 @@ bool VioEstimator::bootstrap()
   last_bias_pairs_ = r.bias_pairs;
 
   if (!r.ok || !r.scale_observable) {
+    // The reconstruction and the gyro bias are good, only the METRE is not: track on vision
+    // alone and ask again over seconds of keyframes (EstimatorParams::visual_init_seconds).
+    if (p_.visual_init_seconds > 0.0 && r.sfm.valid &&
+      r.bias_pairs >= p_.init.bias_min_pairs)
+    {
+      startVisualInit(r);
+    }
     return false;
   }
+  adopt(r, frames_);
+  return true;
+}
 
+void VioEstimator::adopt(const InitResult & r, const std::vector<SfmFrame> & frames)
+{
   // Gravity fixes two of three rotational DoF. Yaw is unobservable and is left at zero --
   // FromTwoVectors gives the MINIMAL rotation, which is exactly right for the same reason
   // ImuInit uses it: there is no information to determine the third axis, so do not invent it.
@@ -151,7 +166,7 @@ bool VioEstimator::bootstrap()
 
   // The tracker resumes from the frame we anchored at -- the LAST one SfM solved, not the
   // base. Anchoring at the base would make the first preintegration span the whole window.
-  t_prev_ = frames_[last].t;
+  t_prev_ = frames[last].t;
   warmup_ = p_.warmup_frames;   // the post-bootstrap id-churn hole is exactly what this rides out
 
   // The bootstrap frame is the window's first keyframe -- its anchor, until the window slides.
@@ -159,19 +174,31 @@ bool VioEstimator::bootstrap()
   since_keyframe_ = 0;
   if (p_.window.enabled) {
     Keyframe kf;
-    kf.t = frames_[last].t;
+    kf.t = frames[last].t;
     kf.x = x_;
-    for (const auto & o : frames_[last].by_id) {
+    for (const auto & o : frames[last].by_id) {
       kf.obs.emplace(o.first, o.second);
     }
     window_.push(std::move(kf));
   }
   initialized_ = true;
-  return true;
 }
 
 bool VioEstimator::pnpFromMap(
   const std::unordered_map<long, cv::Point2f> & obs, NavState & out) const
+{
+  Eigen::Isometry3d T_world_cam;
+  if (!pnpCamera(obs, T_world_cam)) {
+    return false;
+  }
+  const Eigen::Isometry3d T_world_imu = T_world_cam * calib_.T_cam_imu;
+  out.R = Sophus::SO3d(Sophus::SO3d::fitToSO3(T_world_imu.linear()));
+  out.p = T_world_imu.translation();
+  return true;
+}
+
+bool VioEstimator::pnpCamera(
+  const std::unordered_map<long, cv::Point2f> & obs, Eigen::Isometry3d & T_world_cam) const
 {
   std::vector<cv::Point3f> obj;
   std::vector<cv::Point2f> img;
@@ -212,11 +239,141 @@ bool VioEstimator::pnpFromMap(
   T_cam_world.linear() = R;
   T_cam_world.translation() =
     Eigen::Vector3d(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
-  const Eigen::Isometry3d T_world_imu = T_cam_world.inverse() * calib_.T_cam_imu;
-
-  out.R = Sophus::SO3d(Sophus::SO3d::fitToSO3(T_world_imu.linear()));
-  out.p = T_world_imu.translation();
+  T_world_cam = T_cam_world.inverse();
   return true;
+}
+
+// =================================================================================
+// VISUAL INIT -- ORB-SLAM3's answer to a metre one short window cannot give.
+// =================================================================================
+
+void VioEstimator::startVisualInit(const InitResult & r)
+{
+  // ORB-SLAM3 normalizes a fresh monocular map to median depth 1. Here it also keeps the map's
+  // metric depth gates meaningful: the base pair's |t| = 1 puts EuRoC's room tens of units away.
+  std::vector<double> depth;
+  for (const auto & lm : r.sfm.landmark) {
+    depth.push_back(lm.second.z());
+  }
+  std::nth_element(depth.begin(), depth.begin() + depth.size() / 2, depth.end());
+  const double k = depth[depth.size() / 2] > 1e-9 ? 1.0 / depth[depth.size() / 2] : 1.0;
+
+  std::unordered_map<long, Eigen::Vector3d> seed;
+  for (const auto & lm : r.sfm.landmark) {
+    seed.emplace(lm.first, k * lm.second);
+  }
+  map_->clear();
+  map_->seed(seed);
+
+  // The reconstruction's own frames are the first keyframes -- one every keyframe_every, the
+  // spacing the alignment will see from here on.
+  vis_frames_.clear();
+  vis_sfm_ = SfmWindow();
+  vis_sfm_.valid = true;
+  std::vector<int> posed;
+  for (const auto & kv : r.sfm.pose) {
+    posed.push_back(kv.first);
+  }
+  std::sort(posed.begin(), posed.end());
+  for (std::size_t i = 0; i < posed.size();
+    i += static_cast<std::size_t>(p_.window.keyframe_every))
+  {
+    Eigen::Isometry3d T = r.sfm.pose.at(posed[i]);
+    T.translation() *= k;
+    vis_sfm_.pose[static_cast<int>(vis_frames_.size())] = T;
+    vis_frames_.push_back(frames_[posed[i]]);
+  }
+  vis_sfm_.base = 0;
+  vis_gyro_bias_ = r.gyro_bias;
+  vis_bias_pairs_ = r.bias_pairs;
+  vis_t0_ = frames_[posed.front()].t;
+  vis_since_kf_ = 0;
+  vis_misses_ = 0;
+  vis_active_ = true;
+}
+
+void VioEstimator::abortVisualInit()
+{
+  vis_active_ = false;
+  vis_frames_.clear();
+  vis_sfm_ = SfmWindow();
+  map_->clear();
+  since_attempt_ = 0;
+}
+
+FrameResult VioEstimator::visualInitStep(const MeasureGroup & group, double t)
+{
+  FrameResult out;
+  out.stage = FrameResult::Stage::Collecting;
+
+  // Vision alone, in the reconstruction's units: PnP against the map, and grow the map. No IMU
+  // factor and no window -- with the metre unknown they would fight vision, which is exactly how
+  // a rough bootstrap diverged on V1_02/V1_03 (doc/08 §6).
+  std::unordered_map<long, cv::Point2f> obs;
+  for (std::size_t i = 0; i < group.features.ids.size(); ++i) {
+    if (map_->landmarks().count(group.features.ids[i])) {
+      obs.emplace(group.features.ids[i], group.features.points[i]);
+    }
+  }
+  Eigen::Isometry3d T_c0_c;
+  if (!pnpCamera(obs, T_c0_c)) {
+    if (++vis_misses_ > p_.visual_init_max_misses) {
+      abortVisualInit();
+    }
+    return out;
+  }
+  vis_misses_ = 0;
+  map_->insert(group.features, T_c0_c);
+
+  if (++vis_since_kf_ < p_.window.keyframe_every) {
+    return out;
+  }
+  vis_since_kf_ = 0;
+  SfmFrame kf;
+  kf.t = t;
+  for (std::size_t i = 0; i < group.features.ids.size(); ++i) {
+    kf.by_id.emplace(group.features.ids[i], group.features.points[i]);
+  }
+  vis_sfm_.pose[static_cast<int>(vis_frames_.size())] = T_c0_c.inverse();
+  vis_frames_.push_back(std::move(kf));
+
+  if (t - vis_t0_ < p_.visual_init_seconds) {
+    return out;
+  }
+  if (t - vis_t0_ > p_.visual_init_max_seconds) {
+    abortVisualInit();
+    return out;
+  }
+
+  // The alignment, over every keyframe so far -- intervals of keyframe_every frames, not one.
+  InitResult ar;
+  ar.gyro_bias = vis_gyro_bias_;
+  ar.bias_pairs = vis_bias_pairs_;
+  ar.ok = init_->align(vis_frames_, imu_, vis_sfm_, vis_gyro_bias_, ar);
+  ar.sfm = vis_sfm_;
+  ar.sfm.landmark = map_->landmarks();
+  last_init_ = ar;
+  ++bootstrap_attempts_;
+  last_init_t_.clear();
+  for (const auto & kv : vis_sfm_.pose) {
+    last_init_t_[kv.first] = vis_frames_[kv.first].t;
+  }
+  last_failure_ = !ar.ok ? "[V] visual init: alignment refused" :
+    ar.scale <= 0.0 ? "[V] visual init: scale not observable (s <= 0)" :
+    !ar.scale_observable ? "[V] visual init: scale too uncertain" : "";
+  if (!ar.ok || !ar.scale_observable) {
+    return out;
+  }
+
+  vis_active_ = false;
+  adopt(ar, vis_frames_);
+  vis_frames_.clear();
+  out.stage = FrameResult::Stage::Bootstrapped;
+  out.pose_trusted = true;
+  out.pose.linear() = x_.R.matrix();
+  out.pose.translation() = x_.p;
+  out.velocity = x_.v;
+  return out;
 }
 
 void VioEstimator::insertFrame(
@@ -265,6 +422,10 @@ FrameResult VioEstimator::process(const MeasureGroup & group)
     if (static_cast<int>(frames_.size()) < p_.bootstrap_frames) {
       out.stage = FrameResult::Stage::Collecting;
       return out;
+    }
+    if (vis_active_) {
+      frames_.erase(frames_.begin());   // keep collecting, so an abandoned attempt can retry at once
+      return visualInitStep(group, t);
     }
 
     // RETRY EVERY Nth FRAME, NOT EVERY FRAME. A bootstrap attempt is a full SfM plus ~10

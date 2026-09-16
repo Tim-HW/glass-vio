@@ -62,6 +62,15 @@ struct EstimatorParams
   /// -- the 13.5 deg gyro disagreement that then broke the keyframe window at 88.1 s. PnP stays
   /// the Gauss-Newton seed, which is its job. (estimator_check --coast-on-pnp to compare.)
   bool coast_on_pnp = false;
+  /// ORB-SLAM3's monocular-inertial start. When the bootstrap's reconstruction and gyro bias
+  /// succeed but its 1 s alignment cannot fix the metre, track on VISION ALONE -- no IMU factor,
+  /// no window, in the reconstruction's own units -- and retry the alignment over every
+  /// keyframe once this many seconds have passed. 0 = off: refuse and slide, as before.
+  /// Measured why (doc/08 §6): a rough metre let into the IMU-coupled tracker diverges within
+  /// ~1.5 s on V1_02/V1_03, and one 1 s window of 50 ms intervals biases s toward zero.
+  double visual_init_seconds = 0.0;
+  double visual_init_max_seconds = 8.0;   ///< give up and slide the bootstrap window on
+  int visual_init_max_misses = 5;         ///< consecutive failed PnPs before giving up
   /// THE SLIDING WINDOW. Landmarks are maintained rather than frozen: triangulated as tracks
   /// mature against the (metric) state, dropped when they leave view or stop fitting. Without
   /// it, tracking starved after ~4 s with 0 landmarks in view -- measured, not predicted.
@@ -177,6 +186,15 @@ public:
 
 private:
   bool bootstrap();
+  /// Metric world, map and state from an alignment result -- the one conversion both the
+  /// bootstrap and the visual init end in. `frames` is what r's frame indices refer to.
+  void adopt(const InitResult & r, const std::vector<SfmFrame> & frames);
+  void startVisualInit(const InitResult & r);
+  void abortVisualInit();
+  FrameResult visualInitStep(const MeasureGroup & group, double t);
+  /// PnP against the map: the camera's pose in the map's frame, whatever its units.
+  bool pnpCamera(
+    const std::unordered_map<long, cv::Point2f> & obs, Eigen::Isometry3d & T_world_cam) const;
 
   /// Fold this frame into the map at body pose `T_world_body` -- or at the oracle's, when
   /// EstimatorParams::oracle_insert_pose is set. The one place the map is grown from.
@@ -225,6 +243,16 @@ private:
   int bootstrap_attempts_ = 0;
   std::unordered_map<int, double> last_init_t_;
   int warmup_ = 0;
+
+  // Visual init (EstimatorParams::visual_init_seconds).
+  bool vis_active_ = false;
+  std::vector<SfmFrame> vis_frames_;   ///< keyframes; vis_sfm_.pose indexes into this
+  SfmWindow vis_sfm_;
+  Eigen::Vector3d vis_gyro_bias_ = Eigen::Vector3d::Zero();
+  int vis_bias_pairs_ = 0;
+  double vis_t0_ = 0.0;
+  int vis_since_kf_ = 0;
+  int vis_misses_ = 0;
 };
 
 }  // namespace glassvio

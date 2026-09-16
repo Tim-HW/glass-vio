@@ -517,9 +517,42 @@ The gate is *precise* — at 0.06 it has never let a >50% error through — but 
 windows in five, and no threshold separates good from bad cleanly (good windows: median 0.10, bad:
 0.38). A 1 s linear solve with a pass/fail gate is the design choice every system above avoids.
 
-**So what is next** is that design choice: accept a rough bootstrap and correct the scale afterwards
-with an inertial-only nonlinear optimization over several seconds of keyframes — ORB-SLAM3's
-InertialOptimization, repeated as the map grows — rather than asking one short window to be right.
+**A rough bootstrap is not enough on its own — measured.** Before building ORB-SLAM3's inertial
+initialization, the cheap test: does the keyframe window already correct a rough metre?
+(`--max-scale-unc=X` loosens the gate.)
+
+| gate σ_s/s | V1_01 bootstrap · first >1 m | V1_02 | V1_03 |
+|---|---|---|---|
+| 0.06 (default) | 14.7 s · never | 16.9 s · never | 33.6 s · never |
+| 0.10 – 0.30 | **10.2–10.9 s · never** | 11.9–13.4 s · **~1.5 s later** | 13.4–13.6 s · **~1.2 s later** |
+
+On V1_01 even a start at 0.15× the true speed converges to ~1.0 within 5 s. On the fast sequences a
+start at 0.26–0.69× runs away to 2–4× within 1–3 s: the IMU-coupled tracker and window fight vision
+in the wrong metre and lose. That is why ORB-SLAM3 tracks on vision alone until the metre is known.
+
+**Vision-only until the metre is known — built, measured, off.** `EstimatorParams::visual_init_seconds`
+(`--visual-init=S`): when the reconstruction and gyro bias succeed but the alignment refuses, the
+estimator normalizes the reconstruction to median depth 1, tracks by PnP alone with the map growing
+in those units — no IMU factor, no window — and re-runs the *same* stage [4] alignment over every
+keyframe (200 ms intervals, not 50 ms) until it passes or 8 s run out; then the one conversion the
+bootstrap uses (`adopt`) makes it metric.
+
+| `--visual-init=2` | V1_01 | V1_02 | V1_03 |
+|---|---|---|---|
+| bootstrap · first >1 m · ATE | 12.4 s · never · 0.113 m | 24.8 s · **26.0 s** · 2.26 m | 14.6 s · **20.2 s** · 0.65 m |
+
+V1_02 is the instructive failure: it adopted at a speed ratio of **0.998** — the best-scaled start yet
+— and still passed 1 m 1.2 s later. Scored against the truth, its vision-only keyframes had drifted
+**7.2° in rotation** (12.6° in translation direction) over the phase. The metre was right; the map was
+not consistent with the gyro. The first window solve met an IMU cost of 1.5 million, moved the pose
+18 cm, and the map fell from 206 landmarks to 62. PnP alone does not hold a map together for
+seconds; ORB-SLAM3 runs local bundle adjustment through its visual-only phase and a full
+visual-inertial one right after initializing.
+
+**So what is next** is a choice. Either keep that phase's keyframes consistent — bundle-adjust them
+(`bundleAdjust` already exists) or take their rotations from the gyro, as OpenVINS does — or leave
+the bootstrap where it is (15 / 17 / 34 s, every sequence tracked to the end) and go after the 2–3×
+ATE gap in tracking.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -629,7 +662,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--no-forget] [--window-outlier-px=PX] [--no-recycle] \
                                  [--init-log] [--fast=N] [--sfm-window=N] \
                                  [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba] \
-                                 [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N]
+                                 [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N] \
+                                 [--max-scale-unc=X] [--visual-init=S]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker
