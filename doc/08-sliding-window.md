@@ -549,10 +549,50 @@ not consistent with the gyro. The first window solve met an IMU cost of 1.5 mill
 seconds; ORB-SLAM3 runs local bundle adjustment through its visual-only phase and a full
 visual-inertial one right after initializing.
 
-**So what is next** is a choice. Either keep that phase's keyframes consistent — bundle-adjust them
-(`bundleAdjust` already exists) or take their rotations from the gyro, as OpenVINS does — or leave
-the bootstrap where it is (15 / 17 / 34 s, every sequence tracked to the end) and go after the 2–3×
-ATE gap in tracking.
+The bootstrap was left there (15 / 17 / 34 s, every sequence tracked to the end).
+
+**Where the tracking error comes from — measured.** RMS ATE is 0.106 / 0.161 / 0.254 m. Decomposed:
+
+| | V1_01 | V1_02 | V1_03 |
+|---|---|---|---|
+| SE(3) ATE · Sim(3) ATE (best-fit scale) | 0.106 · 0.098 (0.98) | 0.161 · 0.160 (0.99) | 0.254 · 0.253 (0.98) |
+| local ATE over any 10 s, median · max | 0.023 · 0.051 m | 0.043 · 0.129 m | 0.070 · 0.126 m |
+| scale per 10 s segment, spread | 2.3% | 1.6% | 4.3% |
+| attitude error, median | 3.8° | 8.3° | 9.3° |
+
+Not scale (Sim(3) ≈ SE(3), segments within a few percent), and locally accurate — the ATE is slow
+accumulation. The attitude error grows steadily on V1_02/V1_03, and the gyro bias starts ~0.4°/s
+off there against a bootstrap prior of 0.11°/s, so the substitution test followed:
+
+| `estimator_check` | V1_01 ATE | V1_02 ATE · attitude | V1_03 ATE · attitude |
+|---|---|---|---|
+| default | 0.106 m | 0.161 m · 8.3° | 0.254 m · 9.3° |
+| `--oracle-bg` (true gyro bias at bootstrap) | 0.107 m | 0.163 m · **2.5°** | 0.295 m · **5.6°** |
+| `--sigma-bg=0.01` / `0.03` (looser bias prior) | 0.107 m | 0.169 m · 8.5° | 0.239 / 0.264 m · 9.4° |
+| `--oracle-ba` (true accelerometer bias) | 0.164 m | 0.177 m | 0.405 m |
+
+The true gyro bias cuts the attitude error by 3× and moves ATE not at all; the true accelerometer
+bias makes it *worse*. Neither bias is what the position error is made of. (A caution on the
+comparison above: VINS-Mono and ORB-SLAM3 there close loops or reuse the map. The odometry-only rows
+of the same table — OKVIS 0.090 / 0.200 / 0.240, ROVIO 0.100 / 0.100 / 0.140 m — are where glassvio
+actually sits.)
+
+**Forward-backward flow check — built, measured, off.** VINS-Fusion keeps a KLT track only if flowing
+it back lands within 0.5 px (`--flow-back=PX`):
+
+| `--flow-back` | V1_01 ATE | V1_02 first >1 m · ATE | V1_03 first >1 m · ATE |
+|---|---|---|---|
+| off (default) | 0.106 m | never · 0.161 m | never · 0.254 m |
+| 0.5 px | **0.096 m** | 28.7 s · 0.324 m | 49.0 s · 0.727 m |
+| 1.0 px | 0.108 m | 19.4 s · 0.330 m | 97.8 s · 0.412 m |
+
+Better tracks on the easy sequence, starvation on the fast ones: this tracker only re-detects below
+150 live tracks, so every track the check removes is gone until the count collapses — where
+VINS-Fusion tops up to its 150 on every frame. Front-end changes come as a set, not one knob at a time.
+
+**So what is next:** the front end as a set — re-detection policy together with the consistency
+check and corner selection — or Stage B, the marginalization prior that keeps what the window drops
+(odometry systems at this level, OKVIS and VINS, both have one).
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -663,7 +703,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--init-log] [--fast=N] [--sfm-window=N] \
                                  [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba] \
                                  [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N] \
-                                 [--max-scale-unc=X] [--visual-init=S]
+                                 [--max-scale-unc=X] [--visual-init=S] \
+                                 [--oracle-bg] [--sigma-bg=X] [--flow-back=PX]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

@@ -123,6 +123,9 @@ int main(int argc, char ** argv)
   //   --sfm-ba-free-pair  that adjustment fixes only the base frame, not the base pair's partner
   //   --align-stride=N  the alignment uses every Nth posed frame (longer IMU intervals)
   //   --max-scale-unc=X  the bootstrap's scale gate, sigma_s/s (default 0.06)
+  //   --flow-back=PX  the tracker keeps a track only if flowing it back lands within PX (0 = off)
+  //   --oracle-bg     the bootstrap's gyro bias from ground truth (a test oracle)
+  //   --sigma-bg=X    the bootstrap's prior std on the gyro bias, rad/s (default 2e-3)
   //   --visual-init=S  track vision-only after an unobservable alignment, realign over keyframes
   //                   from S seconds on (ORB-SLAM3's start; 0 = off)
   //   --oracle-sfm=rot|pos|both  the bootstrap reconstruction's rotations and/or positions from
@@ -159,6 +162,9 @@ int main(int argc, char ** argv)
   int align_stride = 0;   // 0 = the default
   double max_scale_unc = -1.0;   // < 0 = the default
   double visual_init = -1.0;   // < 0 = the default
+  bool oracle_bg = false;
+  double flow_back = -1.0;   // < 0 = the default
+  double sigma_bg = -1.0;   // < 0 = the default
   std::string oracle_sfm;   // "", "rot", "pos" or "both"
   double window_outlier_px = -1.0;   // < 0 = the default
   glassvio::EstimatorRegressionLimits limits;
@@ -240,6 +246,12 @@ int main(int argc, char ** argv)
         if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
           throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
         }
+      } else if (a.rfind("--flow-back=", 0) == 0) {
+        flow_back = nonnegativeNumber(a.substr(12));
+      } else if (a == "--oracle-bg") {
+        oracle_bg = true;
+      } else if (a.rfind("--sigma-bg=", 0) == 0) {
+        sigma_bg = nonnegativeNumber(a.substr(11));
       } else if (a.rfind("--visual-init=", 0) == 0) {
         visual_init = nonnegativeNumber(a.substr(14));
       } else if (a.rfind("--max-scale-unc=", 0) == 0) {
@@ -290,6 +302,9 @@ int main(int argc, char ** argv)
     glassvio::DatasetOptions opts;
     opts.track_images = true;
     opts.fast_threshold = fast_threshold;
+    if (flow_back >= 0.0) {
+      opts.flow_back_px = flow_back;
+    }
     bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, opts);
   } catch (const std::exception & e) {
     std::fprintf(stderr, "%s\n", e.what());
@@ -358,6 +373,12 @@ int main(int argc, char ** argv)
   ep.init.sfm_ba_fix_pair = !sfm_ba_free_pair;
   if (align_stride > 0) {
     ep.init.align_stride = align_stride;
+  }
+  if (oracle_bg) {
+    ep.init.oracle_gyro_bias = [&](double t, Eigen::Vector3d & bg) {bg = bag.gt.gyroBias(t);};
+  }
+  if (sigma_bg >= 0.0) {
+    ep.sigma_gyro_bias = sigma_bg;
   }
   if (visual_init >= 0.0) {
     ep.visual_init_seconds = visual_init;

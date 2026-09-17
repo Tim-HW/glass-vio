@@ -93,6 +93,9 @@ struct InitializerParams
   /// TEST-ONLY. Called on the reconstruction between stages [2] and [4]; may overwrite its poses
   /// (estimator_check --oracle-sfm substitutes ground truth). Unset in the node.
   std::function<void(const std::vector<SfmFrame> &, SfmWindow &)> oracle_sfm;
+  /// TEST-ONLY. Replaces stage [3]'s gyro bias with the value it writes for time t (estimator_check
+  /// --oracle-bg). Unset in the node.
+  std::function<void(double t, Eigen::Vector3d & gyro_bias)> oracle_gyro_bias;
 };
 
 /// What the bootstrap produced. Everything spatial is in the SFM FRAME -- the base camera --

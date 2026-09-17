@@ -33,9 +33,14 @@ public:
   /// `max_features` : cap on live tracks (detection stops adding past this)
   /// `min_features` : re-detect to top up once live tracks fall below this
   /// `fast_threshold` : FAST corner-response threshold
-  FeatureTracker(int max_features = 1000, int min_features = 150, int fast_threshold = 20)
+  /// `flow_back_px` : keep a track only if flowing it BACK lands within this many pixels of where
+  ///                  it started (VINS-Fusion's flow_back, 0.5 px); 0 = off
+  FeatureTracker(
+    int max_features = 1000, int min_features = 150, int fast_threshold = 20,
+    double flow_back_px = 0.0)
   : max_features_(max_features),
     min_features_(min_features),
+    flow_back_px_(flow_back_px),
     detector_(cv::FastFeatureDetector::create(fast_threshold, true)),
     lk_criteria_(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01)
   {
@@ -92,10 +97,27 @@ private:
     cv::calcOpticalFlowPyrLK(
       prev, curr, prev_pts, next, status, err, cv::Size(21, 21), 3, lk_criteria_);
 
+    // FORWARD-BACKWARD CONSISTENCY. KLT's own error only says the patch matched SOMETHING; flowing
+    // the result back and landing elsewhere says it matched the wrong thing.
+    std::vector<cv::Point2f> back;
+    std::vector<unsigned char> back_status;
+    if (flow_back_px_ > 0.0 && !next.empty()) {
+      std::vector<float> back_err;
+      back = prev_pts;   // seed the reverse flow at the origin, as VINS-Fusion does
+      cv::calcOpticalFlowPyrLK(
+        curr, prev, next, back, back_status, back_err, cv::Size(21, 21), 1, lk_criteria_,
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+    }
+
     constexpr float kMaxError = 20.0f;
     constexpr int kBorder = 5;
     for (std::size_t i = 0; i < prev_pts.size(); ++i) {
       if (!status[i] || err[i] >= kMaxError) {
+        continue;
+      }
+      if (!back.empty() &&
+        (!back_status[i] || cv::norm(back[i] - prev_pts[i]) > flow_back_px_))
+      {
         continue;
       }
       const cv::Point2f & p = next[i];
@@ -143,6 +165,7 @@ private:
 
   int max_features_;
   int min_features_;
+  double flow_back_px_;
   cv::Ptr<cv::FastFeatureDetector> detector_;
   cv::TermCriteria lk_criteria_;
 

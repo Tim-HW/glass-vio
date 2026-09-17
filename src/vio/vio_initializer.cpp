@@ -356,6 +356,9 @@ InitResult VioInitializer::run(
   if (!estimateGyroBias(frames, imu, 0, out.gyro_bias, out.bias_pairs)) {
     return out;
   }
+  if (p_.oracle_gyro_bias) {
+    p_.oracle_gyro_bias(frames.back().t, out.gyro_bias);
+  }
 
   // [4] The metre.
   if (!align(frames, imu, out.sfm, out.gyro_bias, out)) {

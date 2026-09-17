@@ -221,6 +221,7 @@ struct DatasetOptions
   std::string imu_topic = "/imu0";
   std::string image_topic = "/cam0/image_raw";
   int fast_threshold = 20;     ///< FeatureTracker FAST threshold (estimator_check --fast=N)
+  double flow_back_px = 0.0;   ///< FeatureTracker forward-backward check (--flow-back=PX)
 };
 
 /// A EuRoC MAV sequence: the ROS2 bag for sensors, and the ASL CSV for ground truth.
@@ -260,7 +261,7 @@ public:
 
     rclcpp::Serialization<sensor_msgs::msg::Imu> imu_codec;
     rclcpp::Serialization<sensor_msgs::msg::Image> image_codec;
-    FeatureTracker tracker(1000, 150, opts.fast_threshold);
+    FeatureTracker tracker(1000, 150, opts.fast_threshold, opts.flow_back_px);
     int n_frames = 0;
 
     while (reader.has_next()) {
