@@ -124,6 +124,9 @@ int main(int argc, char ** argv)
   //   --align-stride=N  the alignment uses every Nth posed frame (longer IMU intervals)
   //   --max-scale-unc=X  the bootstrap's scale gate, sigma_s/s (default 0.06)
   //   --flow-back=PX  the tracker keeps a track only if flowing it back lands within PX (0 = off)
+  //   --flow-back-keep=N  skip the flow-back check on a frame where fewer than N tracks pass it
+  //   --top-up=N      the tracker refills to N live tracks on every frame (0 = only below 150)
+  //   --min-spacing=PX  minimum distance between a new corner and a live track (default 15)
   //   --oracle-bg     the bootstrap's gyro bias from ground truth (a test oracle)
   //   --sigma-bg=X    the bootstrap's prior std on the gyro bias, rad/s (default 2e-3)
   //   --visual-init=S  track vision-only after an unobservable alignment, realign over keyframes
@@ -164,6 +167,9 @@ int main(int argc, char ** argv)
   double visual_init = -1.0;   // < 0 = the default
   bool oracle_bg = false;
   double flow_back = -1.0;   // < 0 = the default
+  int top_up = -1;   // < 0 = the default
+  int flow_back_keep = -1;   // < 0 = the default
+  double min_spacing = -1.0;   // < 0 = the default
   double sigma_bg = -1.0;   // < 0 = the default
   std::string oracle_sfm;   // "", "rot", "pos" or "both"
   double window_outlier_px = -1.0;   // < 0 = the default
@@ -246,6 +252,12 @@ int main(int argc, char ** argv)
         if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
           throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
         }
+      } else if (a.rfind("--flow-back-keep=", 0) == 0) {
+        flow_back_keep = nonnegativeInteger(a.substr(17));
+      } else if (a.rfind("--top-up=", 0) == 0) {
+        top_up = nonnegativeInteger(a.substr(9));
+      } else if (a.rfind("--min-spacing=", 0) == 0) {
+        min_spacing = nonnegativeNumber(a.substr(14));
       } else if (a.rfind("--flow-back=", 0) == 0) {
         flow_back = nonnegativeNumber(a.substr(12));
       } else if (a == "--oracle-bg") {
@@ -304,6 +316,15 @@ int main(int argc, char ** argv)
     opts.fast_threshold = fast_threshold;
     if (flow_back >= 0.0) {
       opts.flow_back_px = flow_back;
+    }
+    if (top_up >= 0) {
+      opts.top_up_target = top_up;
+    }
+    if (flow_back_keep >= 0) {
+      opts.flow_back_min_keep = flow_back_keep;
+    }
+    if (min_spacing >= 0.0) {
+      opts.min_spacing_px = static_cast<float>(min_spacing);
     }
     bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, opts);
   } catch (const std::exception & e) {

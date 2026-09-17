@@ -590,9 +590,30 @@ Better tracks on the easy sequence, starvation on the fast ones: this tracker on
 150 live tracks, so every track the check removes is gone until the count collapses — where
 VINS-Fusion tops up to its 150 on every frame. Front-end changes come as a set, not one knob at a time.
 
-**So what is next:** the front end as a set — re-detection policy together with the consistency
-check and corner selection — or Stage B, the marginalization prior that keeps what the window drops
-(odometry systems at this level, OKVIS and VINS, both have one).
+**The front end as a set — built, measured, off.** Three changes after VINS-Fusion's tracker, behind
+flags: refill to N live tracks on *every* frame (`--top-up=N`), the forward-backward check
+(`--flow-back=PX`), and a fallback that skips that check on a frame where fewer than K tracks pass
+it (`--flow-back-keep=K`). About 30 runs; the representative ones:
+
+| `estimator_check` | V1_01 ATE | V1_02 ATE | V1_03 |
+|---|---|---|---|
+| default | 0.106 m | 0.161 m | never >1 m · 0.254 m |
+| `--top-up=400` | 0.100 m | 0.114 m | never · 0.386 m |
+| `--top-up=400 --flow-back=0.5` | **0.073 m** | 0.164 m | **loses tracking at 65 s** |
+| `… --flow-back-keep=30` | **0.073 m** | 0.157 m | 1 m at 86.8 s · 0.562 m |
+| `… --flow-back-keep=60` | 0.078 m | **0.105 m** | 1 m at 73.3 s · 2.84 m |
+| `--top-up=250` / `150`, `--min-spacing=20` / `30`, `--flow-back=0.7` / `1.0` | 0.07–0.12 m | 0.10 m to a 4.3 m divergence | lost or diverged in every one |
+
+On V1_01 and V1_02 the set is the first front-end change to cut ATE by about a third. On V1_03 no
+configuration holds, and the outcomes jump from setting to setting: at 63–65 s both the default and
+the checked tracker are down to 0–16 features a frame, and whether the run survives comes down to a
+handful of marginal tracks. That is the difficult sequence's fast, blurred motion at the edge of
+what this tracker can follow — a threshold will not move it.
+
+**So what is next** for the front end is to follow fast motion rather than filter it: predict each
+track's position from the gyro before KLT (VINS-Fusion's `predictPtsInNextFrame` with
+`OPTFLOW_USE_INITIAL_FLOW`), so fast rotation stops costing tracks. Then this set is worth measuring
+again. Stage B marginalization remains the other lever.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -704,7 +725,8 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--refine-gravity] [--oracle-sfm=rot|pos|both] [--no-sfm-ba] \
                                  [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N] \
                                  [--max-scale-unc=X] [--visual-init=S] \
-                                 [--oracle-bg] [--sigma-bg=X] [--flow-back=PX]
+                                 [--oracle-bg] [--sigma-bg=X] [--flow-back=PX] \
+                                 [--flow-back-keep=N] [--top-up=N] [--min-spacing=PX]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

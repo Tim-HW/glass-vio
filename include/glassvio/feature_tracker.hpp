@@ -35,12 +35,19 @@ public:
   /// `fast_threshold` : FAST corner-response threshold
   /// `flow_back_px` : keep a track only if flowing it BACK lands within this many pixels of where
   ///                  it started (VINS-Fusion's flow_back, 0.5 px); 0 = off
+  /// `top_up_target` : when > 0, re-detect on EVERY frame to refill the live tracks to this count
+  ///                   (VINS-Fusion: 150) instead of waiting for them to fall below min_features
+  /// `min_spacing_px` : minimum distance between a new corner and any live track
   FeatureTracker(
     int max_features = 1000, int min_features = 150, int fast_threshold = 20,
-    double flow_back_px = 0.0)
+    double flow_back_px = 0.0, int top_up_target = 0, float min_spacing_px = 15.0f,
+    int flow_back_min_keep = 0)
   : max_features_(max_features),
     min_features_(min_features),
     flow_back_px_(flow_back_px),
+    top_up_target_(top_up_target),
+    min_spacing_px_(min_spacing_px),
+    flow_back_min_keep_(flow_back_min_keep),
     detector_(cv::FastFeatureDetector::create(fast_threshold, true)),
     lk_criteria_(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01)
   {
@@ -55,7 +62,7 @@ public:
       // under their old ids. Low texture (EuRoC V1_01's mattress wall, 87.5-91 s) kept the
       // count under min_features for 22 frames running: ~140 points each, 6-14 px stale, and
       // every tracker solve refused (doc/08 §6).
-      detectInto(gray, prev_pts_, ids_);
+      detectInto(gray, prev_pts_, ids_, cap());
     } else {
       std::vector<cv::Point2f> tracked;
       std::vector<long> tracked_ids;
@@ -73,8 +80,10 @@ public:
       // fix is NOT here -- it is a higher floor or a map-driven re-detect that leaves the
       // reconstruction's tracks intact. Supply the map without breaking the geometry it is
       // built on.
-      if (tracked.size() < static_cast<std::size_t>(min_features_)) {
-        detectInto(gray, tracked, tracked_ids);
+      const std::size_t floor = static_cast<std::size_t>(
+        top_up_target_ > 0 ? top_up_target_ : min_features_);
+      if (tracked.size() < floor) {
+        detectInto(gray, tracked, tracked_ids, cap());
       }
       prev_pts_ = std::move(tracked);
       ids_ = std::move(tracked_ids);
@@ -109,6 +118,19 @@ private:
         cv::OPTFLOW_USE_INITIAL_FLOW);
     }
 
+    // ...unless it would leave almost nothing. In a near-blind stretch the last few marginal tracks
+    // are what keep the solve alive; dropping them measurably lost V1_03 (flow_back_min_keep).
+    if (!back.empty()) {
+      int consistent = 0;
+      for (std::size_t i = 0; i < prev_pts.size(); ++i) {
+        consistent += status[i] && back_status[i] &&
+          cv::norm(back[i] - prev_pts[i]) <= flow_back_px_;
+      }
+      if (consistent < flow_back_min_keep_) {
+        back.clear();
+      }
+    }
+
     constexpr float kMaxError = 20.0f;
     constexpr int kBorder = 5;
     for (std::size_t i = 0; i < prev_pts.size(); ++i) {
@@ -134,9 +156,14 @@ private:
   /// Detect FAST corners in `gray`, keep the strongest, and append those that are not within
   /// kMinSpacing of a feature already in `pts` (surviving tracks plus corners accepted so far
   /// this call). Each kept corner gets a fresh id.
+  std::size_t cap() const
+  {
+    return static_cast<std::size_t>(top_up_target_ > 0 ? top_up_target_ : max_features_);
+  }
+
   void detectInto(
     const cv::Mat & gray,
-    std::vector<cv::Point2f> & pts, std::vector<long> & ids)
+    std::vector<cv::Point2f> & pts, std::vector<long> & ids, std::size_t limit)
   {
     std::vector<cv::KeyPoint> kps;
     detector_->detect(gray, kps);
@@ -144,14 +171,13 @@ private:
       kps.begin(), kps.end(),
       [](const cv::KeyPoint & a, const cv::KeyPoint & b) {return a.response > b.response;});
 
-    constexpr float kMinSpacing = 15.0f;
     for (const auto & kp : kps) {
-      if (pts.size() >= static_cast<std::size_t>(max_features_)) {
+      if (pts.size() >= limit) {
         break;
       }
       bool too_close = false;
       for (const auto & q : pts) {
-        if (cv::norm(kp.pt - q) < kMinSpacing) {
+        if (cv::norm(kp.pt - q) < min_spacing_px_) {
           too_close = true;
           break;
         }
@@ -166,6 +192,9 @@ private:
   int max_features_;
   int min_features_;
   double flow_back_px_;
+  int top_up_target_;
+  float min_spacing_px_;
+  int flow_back_min_keep_;
   cv::Ptr<cv::FastFeatureDetector> detector_;
   cv::TermCriteria lk_criteria_;
 
