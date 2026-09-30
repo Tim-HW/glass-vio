@@ -46,6 +46,8 @@ void triangulateBasePair(
   const cv::Mat K_cv = calib.cvK();
   const Eigen::Matrix3d Kinv = calib.K.inverse();
 
+  // STEP 1 -- the two projection matrices, P = K [R | t]. Camera 1 is the reference, so it sits
+  // at the origin ([I | 0]); camera 2 is where T2 puts it (X_cam2 = T2 * X_cam1).
   cv::Mat P1 = cv::Mat::eye(3, 4, CV_64F);
   cv::Mat P2(3, 4, CV_64F);
   cv::Mat R_cv(3, 3, CV_64F), t_cv(3, 1, CV_64F);
@@ -60,6 +62,9 @@ void triangulateBasePair(
   P1 = K_cv * P1;
   P2 = K_cv * P2;
 
+  // STEP 2 -- triangulate every pair of pixels at once: the 3D point whose two projections land
+  // closest to p1[i] and p2[i]. The answer is homogeneous (x, y, z, w), one column per point,
+  // expressed in camera 1's frame.
   cv::Mat X4f;
   cv::triangulatePoints(P1, P2, p1, p2, X4f);
   // triangulatePoints returns CV_32F for Point2f input. Reading that with at<double>() does
@@ -68,10 +73,14 @@ void triangulateBasePair(
   cv::Mat X4;
   X4f.convertTo(X4, CV_64F);
 
+  // STEP 3 -- keep a point only if it survives every gate below.
   for (int i = 0; i < X4.cols; ++i) {
+    // Gate a: RANSAC already called this pair an outlier of the essential matrix.
     if (!mask.empty() && !mask.at<unsigned char>(i)) {
       continue;
     }
+    // Gate b: w = 0 is a point at infinity (parallel rays). Otherwise divide by w to get metric-
+    // looking coordinates -- in RULER units, not metres.
     const double hw = X4.at<double>(3, i);
     if (std::abs(hw) < 1e-12) {
       continue;
@@ -79,14 +88,15 @@ void triangulateBasePair(
     const Eigen::Vector3d X(
       X4.at<double>(0, i) / hw, X4.at<double>(1, i) / hw, X4.at<double>(2, i) / hw);
 
-    // Cheirality: in front of BOTH cameras. A point behind still projects to a perfectly
+    // Gate c -- cheirality: in front of BOTH cameras. A point behind still projects to a perfectly
     // ordinary-looking pixel -- the wrong one, with a sign-flipped Jacobian.
     if (X.z() < p.min_depth || (T2 * X).z() < p.min_depth) {
       ++out.rejected_cheirality;
       continue;
     }
 
-    // Parallax ANGLE between the two viewing rays. THIS is what a pixel-flow threshold
+    // Gate d -- the parallax ANGLE between the two viewing rays (r1, r2: the unit directions
+    // from each camera centre through its pixel, both written in camera 1's frame). THIS is what a pixel-flow threshold
     // cannot measure: rotation-induced flow clears the filter and dies right here, because
     // the rays stay parallel no matter how far the pixels moved.
     const Eigen::Vector3d r1 = (Kinv * Eigen::Vector3d(p1[i].x, p1[i].y, 1.0)).normalized();
@@ -98,7 +108,7 @@ void triangulateBasePair(
       ++out.rejected_parallax;
       continue;
     }
-    out.landmark.emplace(ids[i], X);
+    out.landmark.emplace(ids[i], X);   // a landmark: track id -> 3D point in camera 1's frame
   }
 }
 
@@ -106,6 +116,7 @@ bool relativeBodyRotation(
   const SfmFrame & a, const SfmFrame & b, const CameraCalib & calib,
   Sophus::SO3d & out, int min_correspondences)
 {
+  // STEP 1 -- correspondences: every track id present in both frames gives one pixel pair.
   std::vector<cv::Point2f> p1, p2;
   for (const auto & entry : a.by_id) {
     const auto it = b.by_id.find(entry.first);
@@ -120,6 +131,10 @@ bool relativeBodyRotation(
 
   const cv::Mat K_cv = (cv::Mat_<double>(3, 3) <<
     calib.K(0, 0), 0, calib.K(0, 2), 0, calib.K(1, 1), calib.K(1, 2), 0, 0, 1);
+  // STEP 2 -- the essential matrix E relates the two views (x2^T E x1 = 0 for every true pair),
+  // fitted by RANSAC so mistracked points do not bend it; then recoverPose decomposes E (an SVD)
+  // into a rotation and a translation DIRECTION, picking the one of four solutions that puts the
+  // points in front of both cameras. Only the rotation is used here; t_cv is discarded.
   cv::Mat mask;
   const cv::Mat E = cv::findEssentialMat(p1, p2, K_cv, cv::RANSAC, 0.999, 1.0, mask);
   if (E.rows != 3 || E.cols != 3) {
@@ -130,7 +145,7 @@ bool relativeBodyRotation(
     return false;
   }
 
-  // Camera rotation -> body rotation. From the pose chain,
+  // STEP 3 -- camera rotation -> body (IMU) rotation. From the pose chain,
   //   R_cj_ci = R_cam_imu . dR_ij^T . R_cam_imu^T
   // so inverting gives dR_ij = R_cam_imu^T . R_cj_ci^T . R_cam_imu.
   const Eigen::Matrix3d R_cam_imu = calib.T_cam_imu.linear();
@@ -144,6 +159,18 @@ SfmWindow buildSfmWindow(
   const std::vector<SfmFrame> & frames, int begin, int end,
   const CameraCalib & calib, const SfmParams & p)
 {
+  // THE WHOLE RECONSTRUCTION, IN ORDER:
+  //
+  //   A. choose a BASE PAIR -- frame `begin` and one later frame -- and get their relative pose
+  //      from the essential matrix. Its translation has no length, so it is declared to be 1:
+  //      the invented unit ("the ruler") everything below is measured in.
+  //   B. TRIANGULATE landmarks from that pair.
+  //   C. PnP: pose every other frame against those landmarks.
+  //   D. (off by default) triangulate the tracks the base pair did not cover.
+  //
+  // Output convention: w.pose[k] maps a point from the base camera's frame into camera k's
+  // (X_ck = pose[k] * X_c0), so pose[begin] is identity; w.landmark[id] is in the base camera's
+  // frame. bundleAdjust() refines all of it afterwards (sfm_bundle.cpp).
   SfmWindow w;
   w.base = begin;
 
@@ -152,7 +179,7 @@ SfmWindow buildSfmWindow(
   const Eigen::Matrix3d Kinv = calib.K.inverse();
   const SfmFrame & base = frames[begin];
 
-  // --- 1+2+3. THE BASE PAIR: parallax is only a FILTER; the geometry decides.
+  // --- A + B. THE BASE PAIR: parallax is only a FILTER; the geometry decides.
   //
   // Pixel flow does NOT mean baseline. On a forward-driving car the two are nearly the same
   // thing, which is why taking the first frame past a flow threshold worked on KITTI. A MAV
@@ -183,12 +210,17 @@ SfmWindow buildSfmWindow(
   cv::Mat mask, R_cv, t_cv;
   Eigen::Isometry3d T2 = Eigen::Isometry3d::Identity();
 
+  // Try each later frame k as the base frame's partner, nearest first, and take the FIRST that
+  // passes every test below. `continue` means "not this one, try the next frame".
   for (int k = begin + 2; k < end; ++k) {
+    // Test 1 -- enough tracks seen in BOTH frames to fit an essential matrix robustly.
     const auto ids = sharedIds(base, frames[k]);
     w.max_shared = std::max(w.max_shared, static_cast<int>(ids.size()));
     if (static_cast<int>(ids.size()) < p.min_shared) {
       continue;
     }
+    // Test 2 -- enough pixel motion: the median distance each shared track moved between the
+    // two frames. Cheap, and only a filter: rotation alone moves pixels too (see above).
     std::vector<double> flow;
     for (long id : ids) {
       const auto & a = base.by_id.at(id);
@@ -202,7 +234,10 @@ SfmWindow buildSfmWindow(
     }
     ++w.candidates_tried;
 
-    // --- The essential matrix. |t| = 1 here IS the ruler.
+    // Test 3 -- the geometry. Fit the essential matrix E to the shared pixel pairs (RANSAC, 1 px),
+    // then decompose it: recoverPose returns the rotation R_cv and the translation DIRECTION t_cv
+    // of frame k relative to the base, and how many pairs end up in front of both cameras.
+    // |t_cv| = 1 by construction, and that 1 IS the ruler.
     p1.clear();
     p2.clear();
     pair_ids.clear();
@@ -220,13 +255,15 @@ SfmWindow buildSfmWindow(
       continue;   // rotation-dominated or degenerate: try the next frame
     }
 
+    // The partner's pose as one transform: X_ck = T2 * X_c0.
     T2 = Eigen::Isometry3d::Identity();
     T2.linear() = matFromCv(R_cv);
     T2.translation() = Eigen::Vector3d(
       t_cv.at<double>(0), t_cv.at<double>(1), t_cv.at<double>(2));
 
-    // --- Triangulate, gated on parallax ANGLE rather than depth. This is the test that a
-    //     pixel-flow threshold cannot make: rotation survives the filter above and dies here.
+    // Test 4 -- does this pair actually yield structure? Triangulate, gated on parallax ANGLE
+    // rather than depth. This is the test a pixel-flow threshold cannot make: rotation survives
+    // the filter above and dies here. Into `trial`, so a rejected candidate leaves `w` untouched.
     SfmWindow trial;
     triangulateBasePair(p1, p2, pair_ids, T2, mask, calib, p, trial);
     w.max_trial_landmarks =
@@ -237,6 +274,7 @@ SfmWindow buildSfmWindow(
       continue;   // cleared the filter, produced no structure -- VINS-Mono's `&&`
     }
 
+    // Accepted: frame k is the base pair's partner. Record both poses and the landmarks.
     w.second = k;
     w.base_parallax_px = parallax_px;
     w.inliers = inliers;
@@ -248,15 +286,16 @@ SfmWindow buildSfmWindow(
     break;
   }
   if (w.second < 0) {
-    return w;
+    return w;   // no frame in the window made a usable pair: the caller slides on and retries
   }
 
-  // --- 4. PnP for the rest. THIS is what propagates the ruler: it consumes landmarks that
+  // --- C. PnP for the rest. THIS is what propagates the ruler: it consumes landmarks that
   //        already carry it and returns a pose in the same units.
   for (int k = begin; k < end; ++k) {
     if (w.pose.count(k)) {
-      continue;
+      continue;   // the two base-pair frames already have their poses
     }
+    // The 3D-2D pairs for this frame: each landmark it still tracks, with the pixel it sees it at.
     std::vector<cv::Point3f> obj;
     std::vector<cv::Point2f> img;
     for (const auto & entry : w.landmark) {
@@ -270,6 +309,9 @@ SfmWindow buildSfmWindow(
     if (static_cast<int>(obj.size()) < p.min_pnp_points) {
       continue;
     }
+    // Solve for the camera pose that projects those landmarks onto those pixels (RANSAC, 2 px).
+    // Landmarks are held FIXED here -- which is why their errors flow into every pose, and why
+    // bundleAdjust() is run afterwards.
     cv::Mat rvec, tvec, inliers;
     if (!cv::solvePnPRansac(
         obj, img, K_cv, cv::Mat(), rvec, tvec, false, 100, 2.0, 0.99, inliers) ||
@@ -277,6 +319,7 @@ SfmWindow buildSfmWindow(
     {
       continue;
     }
+    // OpenCV returns the rotation as an axis-angle vector; Rodrigues turns it into a matrix.
     cv::Mat Rk;
     cv::Rodrigues(rvec, Rk);
     Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
@@ -297,9 +340,11 @@ SfmWindow buildSfmWindow(
     w.pose[k] = T;
   }
 
-  // --- 5. The rest of the window's tracks. Grouped by (first, last) posed frame so each pair is
+  // --- D. The rest of the window's tracks (SfmParams::triangulate_window, off by default). Grouped by (first, last) posed frame so each pair is
   //        one triangulatePoints call; the pair's relative pose is what the base-pair helper wants.
   if (p.triangulate_window) {
+    // For every track that is not yet a landmark, find the FIRST and LAST posed frame that see
+    // it (the widest baseline available), and group the tracks by that pair of frames.
     std::map<std::pair<int, int>, std::vector<long>> by_span;
     {
       std::unordered_map<long, std::pair<int, int>> span;
@@ -335,6 +380,8 @@ SfmWindow buildSfmWindow(
       SfmWindow trial;
       triangulateBasePair(
         pa, pb, group.second, w.pose.at(b) * w.pose.at(a).inverse(), cv::Mat(), calib, p, trial);
+      // The helper returns points in frame a's camera; move them into the base camera's frame,
+      // and keep one only if it reprojects well in EVERY posed frame that tracked it.
       const Eigen::Isometry3d T_c0_ca = w.pose.at(a).inverse();
       for (const auto & lm : trial.landmark) {
         const Eigen::Vector3d X = T_c0_ca * lm.second;
@@ -359,6 +406,7 @@ SfmWindow buildSfmWindow(
     }
   }
 
+  // A reconstruction is usable only if enough frames were posed for the alignment to work with.
   w.valid = w.pose.size() >= 5;
   return w;
 }
