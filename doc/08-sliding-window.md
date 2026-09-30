@@ -464,7 +464,7 @@ alignment. The alignment is sound — it is being fed translations (4–8° off 
 frame to frame by PnP) that no metric trajectory fits.
 
 **Bundle-adjusting the reconstruction — built, measured, on.** `bundleAdjust`
-([`sfm_bundle.cpp`](../src/vio/sfm_bundle.cpp)) is VINS-Fusion's GlobalSFM step: every posed frame
+([`sfm_bundle.cpp`](../src/sfm/sfm_bundle.cpp)) is VINS-Fusion's GlobalSFM step: every posed frame
 and every landmark of the window, jointly, on Huber-weighted reprojection error, Levenberg-Marquardt
 with each landmark eliminated by its own 3×3 Schur block. The base frame and its base-pair partner
 stay fixed — the similarity gauge, and the ruler stage [4]'s s is measured in. It adds no new

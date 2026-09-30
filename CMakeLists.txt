@@ -45,7 +45,8 @@ add_library(vio
   src/vio/vio_estimator.cpp
   src/vio/landmark_map.cpp
   src/vio/keyframe_window.cpp
-  src/vio/sfm_bundle.cpp)
+  src/sfm/sfm_window.cpp
+  src/sfm/sfm_bundle.cpp)
 target_include_directories(vio PUBLIC include)
 ament_target_dependencies(vio
   rclcpp sensor_msgs geometry_msgs rosbag2_cpp cv_bridge OpenCV)
