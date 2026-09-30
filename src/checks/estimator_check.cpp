@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <limits>
 #include <stdexcept>
@@ -77,266 +78,252 @@ sensor_msgs::msg::Imu::ConstSharedPtr toMsg(const glassvio::StampedImu & s)
   return m;
 }
 
+
+/// Everything the command line can change, written straight into the structs the run uses. A
+/// flag is ONE entry in flags() below -- it used to be a comment, a sentinel variable, a parse
+/// branch and an apply-to-params block, in four different places, for each of forty flags.
+struct Options
+{
+  glassvio::EstimatorParams ep;   // exactly the node's defaults, unless a flag says otherwise
+  glassvio::DatasetOptions data;
+  glassvio::EstimatorRegressionLimits limits;
+  std::vector<std::string> pos;   // [bag] [config] [out.csv]
+  std::string gt_path;
+  std::string mode = "est-ba";    // est-ba | no-est-ba | oracle-ba
+  std::string oracle_sfm;         // "", rot, pos or both
+  double imu_noise_x = 0.0;       // 0 = the datasheet densities
+  bool oracle_map = false;
+  bool oracle_bg = false;
+  bool init_log = false;
+  bool report_only = false;
+};
+
+struct Flag
+{
+  const char * name;    ///< "--window"; one that takes a value is written --window=K
+  const char * value;   ///< nullptr for a switch, else the placeholder --help shows
+  const char * help;
+  std::function<void(Options &, const std::string &)> set;
+};
+
+/// A count or a weight where 0 means "leave the default alone".
+template<typename T>
+void setIfPositive(T & field, double v)
+{
+  if (v > 0.0) {
+    field = static_cast<T>(v);
+  }
+}
+
+const std::vector<Flag> & flags()
+{
+  using O = Options;
+  using S = const std::string &;
+  static const std::vector<Flag> table = {
+    // --- inputs and the quality gate
+    {"--gt", "PATH", "ground-truth CSV; required for a nondefault bag",
+      [](O & o, S v) {
+        if (v.empty()) {throw std::invalid_argument("--gt requires a path");}
+        o.gt_path = v;
+      }},
+    {"--min-tracked-seconds", "S", "default 60, measured from bootstrap",
+      [](O & o, S v) {o.limits.min_tracked_seconds = nonnegativeNumber(v);}},
+    {"--max-median-error", "M", "default 0.75 metres",
+      [](O & o, S v) {o.limits.max_median_error = nonnegativeNumber(v);}},
+    {"--min-below-1m-seconds", "S", "default 30, continuous since bootstrap",
+      [](O & o, S v) {o.limits.min_below_1m_seconds = nonnegativeNumber(v);}},
+    {"--report-only", nullptr, "print quality failures but exit 0",
+      [](O & o, S) {o.report_only = true;}},
+
+    // --- the accel-bias experiment and the oracles (doc/08 §4-§6). Oracles are TEST-ONLY:
+    //     they split "X is the cause" from "X is a bystander", they are not modes to ship.
+    {"--no-est-ba", nullptr, "b_a pinned at 0 through the bootstrap (the old baseline)",
+      [](O & o, S) {o.mode = "no-est-ba";}},
+    {"--oracle-ba", nullptr, "b_a pinned at the dataset's TRUE value",
+      [](O & o, S) {o.mode = "oracle-ba";}},
+    {"--oracle-bg", nullptr, "the bootstrap's gyro bias from ground truth",
+      [](O & o, S) {o.oracle_bg = true;}},
+    {"--oracle-map", nullptr, "triangulate new landmarks from GROUND-TRUTH poses",
+      [](O & o, S) {o.oracle_map = true;}},
+    {"--oracle-sfm", "rot|pos|both",
+      "the bootstrap reconstruction's rotations and/or positions from ground truth",
+      [](O & o, S v) {
+        if (v != "rot" && v != "pos" && v != "both") {
+          throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
+        }
+        o.oracle_sfm = v;
+      }},
+
+    // --- camera-vs-IMU weighting (doc/08 §6, Step 0)
+    {"--parallax", "DEG", "the map's minimum triangulation parallax (default 1.0)",
+      [](O & o, S v) {setIfPositive(o.ep.map.min_parallax_deg, nonnegativeNumber(v));}},
+    {"--px-sigma", "PX", "pixel noise the camera rows are whitened by (default 1.0)",
+      [](O & o, S v) {setIfPositive(o.ep.visual.reproj.sigma_px, nonnegativeNumber(v));}},
+    {"--imu-weight", "W", "scale on the IMU factor's information (default 1.0)",
+      [](O & o, S v) {setIfPositive(o.ep.visual.imu_prior_weight, nonnegativeNumber(v));}},
+    {"--imu-noise-x", "K", "multiply the datasheet IMU noise densities",
+      [](O & o, S v) {o.imu_noise_x = nonnegativeNumber(v);}},
+    {"--sigma-bg", "X", "the bootstrap's prior std on the gyro bias, rad/s (default 2e-3)",
+      [](O & o, S v) {o.ep.sigma_gyro_bias = nonnegativeNumber(v);}},
+
+    // --- Stage A, the keyframe window
+    {"--no-window", nullptr, "the per-frame tracker alone, as before Stage A",
+      [](O & o, S) {o.ep.window.enabled = false;}},
+    {"--anchor-gauge", nullptr, "VINS's anchor (position + yaw pinned) instead of ORB-SLAM3's",
+      [](O & o, S) {o.ep.window.anchor_full = false;}},
+    {"--kf-every", "N", "tracked frames between keyframes (default 4)",
+      [](O & o, S v) {setIfPositive(o.ep.window.keyframe_every, nonnegativeInteger(v));}},
+    {"--window", "K", "keyframes in the window (default 10)",
+      [](O & o, S v) {setIfPositive(o.ep.window.max_keyframes, nonnegativeInteger(v));}},
+    {"--window-tri", nullptr, "the window also triangulates new landmarks (measured worse)",
+      [](O & o, S) {o.ep.window.triangulate = true;}},
+    {"--no-map-tri", nullptr, "the map does not triangulate; new landmarks from the window only",
+      [](O & o, S) {o.ep.map.triangulate = false;}},
+    {"--gravity", nullptr, "re-estimate gravity's direction in the window (no position gain)",
+      [](O & o, S) {o.ep.window.estimate_gravity = true;}},
+    {"--gravity-sigma", "DEG", "the window's prior on gravity's direction (default 1; 0 = none)",
+      [](O & o, S v) {o.ep.window.gravity_sigma_deg = nonnegativeNumber(v);}},
+    {"--window-outlier-px", "PX", "the window drops views more than PX off before solving",
+      [](O & o, S v) {o.ep.window.outlier_px = nonnegativeNumber(v);}},
+    {"--no-forget", nullptr, "the window keeps its views of a landmark the map dropped",
+      [](O & o, S) {o.ep.window.forget_outliers = false;}},
+
+    // --- the tracker solve and the map
+    {"--inlier-fraction", "F", "refuse a tracker solve below this inlier fraction (default 0.5)",
+      [](O & o, S v) {o.ep.visual.min_inlier_fraction = nonnegativeNumber(v);}},
+    {"--no-refused-insert", nullptr, "while coasting, do not insert a refused solve's frame",
+      [](O & o, S) {o.ep.coast_insert_refused = false;}},
+    {"--coast-on-pnp", nullptr, "a coast adopts the PnP seed instead of the IMU prediction",
+      [](O & o, S) {o.ep.coast_on_pnp = true;}},
+    {"--no-recycle", nullptr, "a track dropped as an outlier is never triangulated again",
+      [](O & o, S) {o.ep.map.recycle_outliers = false;}},
+
+    // --- the bootstrap
+    {"--init-log", nullptr, "one line per bootstrap attempt: the stage that refused, and why",
+      [](O & o, S) {o.init_log = true;}},
+    {"--sfm-window", "N", "frames the bootstrap reconstructs and aligns over (default 20)",
+      [](O & o, S v) {setIfPositive(o.ep.init.window_frames, nonnegativeNumber(v));}},
+    {"--no-sfm-ba", nullptr, "skip the bundle adjustment of the bootstrap reconstruction",
+      [](O & o, S) {o.ep.init.sfm_bundle_adjust = false;}},
+    {"--sfm-ba-free-pair", nullptr, "that adjustment fixes only the base frame",
+      [](O & o, S) {o.ep.init.sfm_ba_fix_pair = false;}},
+    {"--sfm-tri", nullptr, "also triangulate the rest of the window's tracks (measured worse)",
+      [](O & o, S) {o.ep.init.sfm.triangulate_window = true;}},
+    {"--refine-gravity", nullptr, "fix |g| and re-solve gravity's direction (VINS-Fusion)",
+      [](O & o, S) {o.ep.init.refine_gravity = true;}},
+    {"--align-stride", "N", "the alignment uses every Nth posed frame",
+      [](O & o, S v) {setIfPositive(o.ep.init.align_stride, nonnegativeInteger(v));}},
+    {"--max-scale-unc", "X", "the bootstrap's scale gate, sigma_s/s (default 0.06)",
+      [](O & o, S v) {o.ep.init.max_scale_uncertainty = nonnegativeNumber(v);}},
+    {"--visual-init", "S", "track vision-only after a refused alignment, realign from S s on",
+      [](O & o, S v) {o.ep.visual_init_seconds = nonnegativeNumber(v);}},
+
+    // --- the front end
+    {"--fast", "N", "the tracker's FAST corner threshold (default 20)",
+      [](O & o, S v) {o.data.fast_threshold = static_cast<int>(nonnegativeNumber(v));}},
+    {"--top-up", "N", "refill to N live tracks on every frame (0 = only below 150)",
+      [](O & o, S v) {o.data.top_up_target = nonnegativeInteger(v);}},
+    {"--min-spacing", "PX", "minimum distance between a new corner and a live track (15)",
+      [](O & o, S v) {o.data.min_spacing_px = static_cast<float>(nonnegativeNumber(v));}},
+    {"--flow-back", "PX", "keep a track only if flowing it back lands within PX (0 = off)",
+      [](O & o, S v) {o.data.flow_back_px = nonnegativeNumber(v);}},
+    {"--flow-back-keep", "N", "skip that check on a frame where fewer than N tracks pass it",
+      [](O & o, S v) {o.data.flow_back_min_keep = nonnegativeInteger(v);}},
+  };
+  return table;
+}
+
+void printHelp()
+{
+  std::printf(
+    "Usage: estimator_check [bag] [config] [out.csv] [options]\n"
+    "Experiments are described in doc/08-sliding-window.md.\n");
+  for (const Flag & f : flags()) {
+    const std::string left = std::string(f.name) + (f.value ? std::string("=") + f.value : "");
+    std::printf("  %-28s %s\n", left.c_str(), f.help);
+  }
+  std::printf(
+    "Exit codes: 0 quality pass (or report-only), 1 quality failure, 2 input/I/O error.\n");
+}
+
+/// False when --help was asked for and printed. Throws std::invalid_argument on a bad one.
+bool parseArgs(int argc, char ** argv, Options & o)
+{
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--help") {
+      printHelp();
+      return false;
+    }
+    if (a.empty() || a.front() != '-') {
+      o.pos.push_back(a);
+      continue;
+    }
+    bool known = false;
+    for (const Flag & f : flags()) {
+      const std::string name = f.name;
+      if (f.value == nullptr ? a == name : a.rfind(name + "=", 0) == 0) {
+        f.set(o, f.value == nullptr ? std::string() : a.substr(name.size() + 1));
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      throw std::invalid_argument("unknown option: " + a);
+    }
+  }
+  if (o.pos.size() > 3) {
+    throw std::invalid_argument("expected at most [bag] [config] [out.csv]");
+  }
+  if (o.gt_path.empty()) {
+    if (!o.pos.empty() && o.pos[0] != kDefaultBag) {
+      throw std::invalid_argument("a nondefault bag requires --gt=PATH");
+    }
+    o.gt_path = kDefaultGt;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
 {
-  // Positional [bag] [config] [out.csv], plus one optional flag for the accel-bias experiment
-  // (doc/08-sliding-window.md §5):
-  //   (none)       the node's defaults: b_a estimated in the alignment when observable
-  //   --no-est-ba  b_a pinned at 0 through the bootstrap -- the old behaviour, the baseline
-  //   --oracle-ba  b_a pinned at the dataset's TRUE value: what the scale would be if b_a were
-  //                known. An oracle, not a mode to ship -- it splits "b_a is the cause" from
-  //                "b_a is a bystander".
-  // and, independently, for where the scale goes during TRACKING:
-  //   --oracle-map    triangulate new landmarks from GROUND-TRUTH poses (carried into the
-  //                   estimator's world by T_align) instead of solved ones
-  //   --parallax=DEG  the map's minimum triangulation parallax (default 1.0 deg)
-  // and the camera-vs-IMU weighting (doc/08-sliding-window.md §6, Step 0):
-  //   --px-sigma=PX   pixel noise the camera rows are whitened by (default 1.0)
-  //   --imu-weight=W  scale on the IMU factor's information (default 1.0)
-  //   --imu-noise-x=K multiply the datasheet IMU noise densities (EuRoC's MAV vibrates)
-  // and Stage A, the keyframe window (doc/08-sliding-window.md §6):
-  //   --no-window     the per-frame tracker alone, as before Stage A
-  //   --anchor-gauge  VINS's anchor (position + yaw pinned, tilt soft) instead of ORB-SLAM3's
-  //   --kf-every=N    tracked frames between keyframes (default 4)
-  //   --window=K      keyframes in the window (default 10)
-  //   --window-tri    the window ALSO triangulates new landmarks, from its optimized poses (off
-  //                   by default: measured worse, doc/08 §6)
-  //   --no-map-tri    the map does not triangulate either -- new landmarks from the window alone
-  //   --gravity       re-estimate gravity's direction in the window (off by default: it halves
-  //                   the tilt but gains no position accuracy, doc/08 §6)
-  //   --gravity-sigma=DEG  the window's prior on gravity's direction (default 1 deg; 0 = none)
-  //   --inlier-fraction=F  refuse a tracker solve when fewer than F of its observations agree
-  //                   with it (default 0.5; 0 = accept every converged solve, as before)
-  //   --no-refused-insert  while coasting, do not insert a refused solve's frame at the
-  //                   coasted pose (starved frames still are)
-  //   --coast-on-pnp  a coast frame adopts the PnP-replaced seed, as before, instead of the IMU
-  //                   prediction
-  //   --no-recycle    a track dropped as an outlier is never triangulated again
-  //   --no-forget     the window keeps its views of a landmark the map dropped as an outlier
-  //   --init-log      one line per bootstrap attempt: the stage that refused, and its numbers
-  //   --sfm-window=N  frames the bootstrap reconstructs and aligns over (the node uses 30)
-  //   --refine-gravity  the alignment fixes |g| and re-solves gravity's direction (VINS-Fusion)
-  //   --no-sfm-ba     the bootstrap reconstruction goes to the alignment without bundle adjustment
-  //   --sfm-tri       the bootstrap reconstruction also triangulates the rest of the window's tracks
-  //   --sfm-ba-free-pair  that adjustment fixes only the base frame, not the base pair's partner
-  //   --align-stride=N  the alignment uses every Nth posed frame (longer IMU intervals)
-  //   --max-scale-unc=X  the bootstrap's scale gate, sigma_s/s (default 0.06)
-  //   --flow-back=PX  the tracker keeps a track only if flowing it back lands within PX (0 = off)
-  //   --flow-back-keep=N  skip the flow-back check on a frame where fewer than N tracks pass it
-  //   --top-up=N      the tracker refills to N live tracks on every frame (0 = only below 150)
-  //   --min-spacing=PX  minimum distance between a new corner and a live track (default 15)
-  //   --oracle-bg     the bootstrap's gyro bias from ground truth (a test oracle)
-  //   --sigma-bg=X    the bootstrap's prior std on the gyro bias, rad/s (default 2e-3)
-  //   --visual-init=S  track vision-only after an unobservable alignment, realign over keyframes
-  //                   from S seconds on (ORB-SLAM3's start; 0 = off)
-  //   --oracle-sfm=rot|pos|both  the bootstrap reconstruction's rotations and/or positions from
-  //                   ground truth, in the reconstruction's own ruler -- is stage [4] fed badly?
-  //   --fast=N        the tracker's FAST corner threshold (default 20)
-  //   --window-outlier-px=PX  the window drops observations more than PX off before solving
-  std::vector<std::string> pos;
-  std::string mode = "est-ba";
-  bool oracle_map = false;
-  double parallax_deg = 0.0;   // 0 = the node's default, for this and the two below
-  double px_sigma = 0.0;
-  double imu_weight = 0.0;
-  double imu_noise_x = 0.0;
-  bool no_window = false;
-  bool anchor_gauge = false;
-  int kf_every = 0;
-  int window_k = 0;
-  bool window_tri = false;
-  bool no_map_tri = false;
-  bool gravity = false;
-  double gravity_sigma = -1.0;   // < 0 = the default
-  double inlier_fraction = -1.0;   // < 0 = the default
-  bool no_refused_insert = false;
-  bool coast_on_pnp = false;
-  bool no_recycle = false;
-  bool no_forget = false;
-  bool init_log = false;
-  int fast_threshold = 20;
-  int sfm_window = 0;   // 0 = the initializer default
-  bool refine_gravity = false;
-  bool no_sfm_ba = false;
-  bool sfm_tri = false;
-  bool sfm_ba_free_pair = false;
-  int align_stride = 0;   // 0 = the default
-  double max_scale_unc = -1.0;   // < 0 = the default
-  double visual_init = -1.0;   // < 0 = the default
-  bool oracle_bg = false;
-  double flow_back = -1.0;   // < 0 = the default
-  int top_up = -1;   // < 0 = the default
-  int flow_back_keep = -1;   // < 0 = the default
-  double min_spacing = -1.0;   // < 0 = the default
-  double sigma_bg = -1.0;   // < 0 = the default
-  std::string oracle_sfm;   // "", "rot", "pos" or "both"
-  double window_outlier_px = -1.0;   // < 0 = the default
-  glassvio::EstimatorRegressionLimits limits;
-  bool report_only = false;
-  std::string gt_path;
+  Options o;
   try {
-    for (int i = 1; i < argc; ++i) {
-      const std::string a = argv[i];
-      if (a == "--help") {
-        std::printf(
-          "Usage: estimator_check [bag] [config] [out.csv] [options]\n"
-          "  --gt=PATH                  required for a nondefault bag\n"
-          "  --min-tracked-seconds=S     default 60, measured from bootstrap\n"
-          "  --max-median-error=M        default 0.75 metres\n"
-          "  --min-below-1m-seconds=S    default 30, continuous since bootstrap\n"
-          "  --report-only              print quality failures but exit 0\n"
-          "Experiment options (see doc/08-sliding-window.md):\n"
-          "  --no-est-ba --oracle-ba --oracle-map --parallax=DEG --px-sigma=PX\n"
-          "  --imu-weight=W --imu-noise-x=K --no-window --anchor-gauge\n"
-          "  --kf-every=N --window=K --window-tri --no-map-tri --gravity\n"
-          "  --gravity-sigma=DEG --inlier-fraction=F\n"
-          "Exit codes: 0 quality pass (or report-only), 1 quality failure, 2 input/I/O error.\n");
-        return 0;
-      } else if (a.rfind("--gt=", 0) == 0) {
-        gt_path = a.substr(5);
-        if (gt_path.empty()) {
-          throw std::invalid_argument("--gt requires a path");
-        }
-      } else if (a == "--report-only") {
-        report_only = true;
-      } else if (a.rfind("--min-tracked-seconds=", 0) == 0) {
-        limits.min_tracked_seconds = nonnegativeNumber(a.substr(22));
-      } else if (a.rfind("--max-median-error=", 0) == 0) {
-        limits.max_median_error = nonnegativeNumber(a.substr(19));
-      } else if (a.rfind("--min-below-1m-seconds=", 0) == 0) {
-        limits.min_below_1m_seconds = nonnegativeNumber(a.substr(23));
-      } else if (a == "--no-est-ba" || a == "--oracle-ba") {
-        mode = a.substr(2);
-      } else if (a == "--oracle-map") {
-        oracle_map = true;
-      } else if (a.rfind("--parallax=", 0) == 0) {
-        parallax_deg = nonnegativeNumber(a.substr(11));
-      } else if (a.rfind("--px-sigma=", 0) == 0) {
-        px_sigma = nonnegativeNumber(a.substr(11));
-      } else if (a.rfind("--imu-weight=", 0) == 0) {
-        imu_weight = nonnegativeNumber(a.substr(13));
-      } else if (a.rfind("--imu-noise-x=", 0) == 0) {
-        imu_noise_x = nonnegativeNumber(a.substr(14));
-      } else if (a == "--no-window") {
-        no_window = true;
-      } else if (a == "--anchor-gauge") {
-        anchor_gauge = true;
-      } else if (a.rfind("--kf-every=", 0) == 0) {
-        kf_every = nonnegativeInteger(a.substr(11));
-      } else if (a.rfind("--window=", 0) == 0) {
-        window_k = nonnegativeInteger(a.substr(9));
-      } else if (a == "--window-tri") {
-        window_tri = true;
-      } else if (a == "--no-map-tri") {
-        no_map_tri = true;
-      } else if (a == "--gravity") {
-        gravity = true;
-      } else if (a.rfind("--gravity-sigma=", 0) == 0) {
-        gravity_sigma = nonnegativeNumber(a.substr(16));
-      } else if (a.rfind("--inlier-fraction=", 0) == 0) {
-        inlier_fraction = nonnegativeNumber(a.substr(18));
-      } else if (a == "--no-refused-insert") {
-        no_refused_insert = true;
-      } else if (a == "--coast-on-pnp") {
-        coast_on_pnp = true;
-      } else if (a == "--no-recycle") {
-        no_recycle = true;
-      } else if (a == "--no-forget") {
-        no_forget = true;
-      } else if (a == "--init-log") {
-        init_log = true;
-      } else if (a.rfind("--oracle-sfm=", 0) == 0) {
-        oracle_sfm = a.substr(13);
-        if (oracle_sfm != "rot" && oracle_sfm != "pos" && oracle_sfm != "both") {
-          throw std::invalid_argument("--oracle-sfm takes rot, pos or both");
-        }
-      } else if (a.rfind("--flow-back-keep=", 0) == 0) {
-        flow_back_keep = nonnegativeInteger(a.substr(17));
-      } else if (a.rfind("--top-up=", 0) == 0) {
-        top_up = nonnegativeInteger(a.substr(9));
-      } else if (a.rfind("--min-spacing=", 0) == 0) {
-        min_spacing = nonnegativeNumber(a.substr(14));
-      } else if (a.rfind("--flow-back=", 0) == 0) {
-        flow_back = nonnegativeNumber(a.substr(12));
-      } else if (a == "--oracle-bg") {
-        oracle_bg = true;
-      } else if (a.rfind("--sigma-bg=", 0) == 0) {
-        sigma_bg = nonnegativeNumber(a.substr(11));
-      } else if (a.rfind("--visual-init=", 0) == 0) {
-        visual_init = nonnegativeNumber(a.substr(14));
-      } else if (a.rfind("--max-scale-unc=", 0) == 0) {
-        max_scale_unc = nonnegativeNumber(a.substr(16));
-      } else if (a.rfind("--align-stride=", 0) == 0) {
-        align_stride = nonnegativeInteger(a.substr(15));
-      } else if (a == "--sfm-ba-free-pair") {
-        sfm_ba_free_pair = true;
-      } else if (a == "--sfm-tri") {
-        sfm_tri = true;
-      } else if (a == "--no-sfm-ba") {
-        no_sfm_ba = true;
-      } else if (a == "--refine-gravity") {
-        refine_gravity = true;
-      } else if (a.rfind("--sfm-window=", 0) == 0) {
-        sfm_window = static_cast<int>(nonnegativeNumber(a.substr(13)));
-      } else if (a.rfind("--fast=", 0) == 0) {
-        fast_threshold = static_cast<int>(nonnegativeNumber(a.substr(7)));
-      } else if (a.rfind("--window-outlier-px=", 0) == 0) {
-        window_outlier_px = nonnegativeNumber(a.substr(20));
-      } else if (!a.empty() && a.front() == '-') {
-        throw std::invalid_argument("unknown option: " + a);
-      } else {
-        pos.push_back(a);
-      }
-    }
-    if (pos.size() > 3) {
-      throw std::invalid_argument("expected at most [bag] [config] [out.csv]");
-    }
-    if (gt_path.empty()) {
-      if (!pos.empty() && pos[0] != kDefaultBag) {
-        throw std::invalid_argument("a nondefault bag requires --gt=PATH");
-      }
-      gt_path = kDefaultGt;
+    if (!parseArgs(argc, argv, o)) {
+      return 0;
     }
   } catch (const std::exception & e) {
     std::fprintf(stderr, "invalid arguments: %s\n", e.what());
     return 2;
   }
-  const std::string bag_path = pos.size() > 0 ? pos[0] : kDefaultBag;
-  const std::string calib_dir = pos.size() > 1 ? pos[1] : "config";
-  const std::string csv_path = pos.size() > 2 ? pos[2] : "/tmp/glassvio_run.csv";
+  const std::string bag_path = o.pos.size() > 0 ? o.pos[0] : kDefaultBag;
+  const std::string calib_dir = o.pos.size() > 1 ? o.pos[1] : "config";
+  const std::string csv_path = o.pos.size() > 2 ? o.pos[2] : "/tmp/glassvio_run.csv";
+  glassvio::EstimatorParams & ep = o.ep;
+  const std::string & mode = o.mode;
+  const std::string & oracle_sfm = o.oracle_sfm;
+  const glassvio::EstimatorRegressionLimits & limits = o.limits;
+  const bool oracle_map = o.oracle_map;
+  const bool init_log = o.init_log;
+  const bool report_only = o.report_only;
 
   glassvio::CameraCalib calib;
   glassvio::EurocDataset bag;
   try {
     calib = glassvio::loadEurocCalib(calib_dir);
-    glassvio::DatasetOptions opts;
-    opts.track_images = true;
-    opts.fast_threshold = fast_threshold;
-    if (flow_back >= 0.0) {
-      opts.flow_back_px = flow_back;
-    }
-    if (top_up >= 0) {
-      opts.top_up_target = top_up;
-    }
-    if (flow_back_keep >= 0) {
-      opts.flow_back_min_keep = flow_back_keep;
-    }
-    if (min_spacing >= 0.0) {
-      opts.min_spacing_px = static_cast<float>(min_spacing);
-    }
-    bag = glassvio::EurocDataset::load(bag_path, gt_path, calib, opts);
+    o.data.track_images = true;
+    bag = glassvio::EurocDataset::load(bag_path, o.gt_path, calib, o.data);
   } catch (const std::exception & e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;
   }
-  if (imu_noise_x > 0.0) {
-    calib.gyro_noise *= imu_noise_x;
-    calib.accel_noise *= imu_noise_x;
+  if (o.imu_noise_x > 0.0) {
+    calib.gyro_noise *= o.imu_noise_x;
+    calib.accel_noise *= o.imu_noise_x;
     std::printf(
       "IMU noise densities x%.1f: gyro %.3g rad/s/rtHz, accel %.3g m/s^2/rtHz\n",
-      imu_noise_x, calib.gyro_noise, calib.accel_noise);
+      o.imu_noise_x, calib.gyro_noise, calib.accel_noise);
   }
   if (bag.frames.size() < 100 || bag.imu.empty() || bag.gt.empty()) {
     std::fprintf(stderr, "need image, imu and ground-truth streams\n");
@@ -346,7 +333,7 @@ int main(int argc, char ** argv)
     "deterministic drive: %zu frames, %zu imu, %zu gt\n",
     bag.frames.size(), bag.imu.size(), bag.gt.size());
 
-  glassvio::EstimatorParams ep;   // exactly the node's defaults, unless a mode flag says otherwise
+  // What needs the loaded bag: the oracles read the ground truth.
   if (mode != "est-ba") {
     ep.init.estimate_accel_bias = false;
   }
@@ -355,60 +342,8 @@ int main(int argc, char ** argv)
     const std::size_t kb = std::min<std::size_t>(ep.bootstrap_frames, bag.frames.size() - 1);
     ep.init.accel_bias = bag.gt.accelBias(bag.frames[kb].t);
   }
-  if (parallax_deg > 0.0) {
-    ep.map.min_parallax_deg = parallax_deg;
-  }
-  if (px_sigma > 0.0) {
-    ep.visual.reproj.sigma_px = px_sigma;
-  }
-  if (imu_weight > 0.0) {
-    ep.visual.imu_prior_weight = imu_weight;
-  }
-  ep.window.enabled = !no_window;
-  ep.window.anchor_full = !anchor_gauge;
-  if (kf_every > 0) {
-    ep.window.keyframe_every = kf_every;
-  }
-  if (window_k > 0) {
-    ep.window.max_keyframes = window_k;
-  }
-  ep.window.triangulate = window_tri;
-  ep.map.triangulate = !no_map_tri;
-  ep.window.estimate_gravity = gravity;
-  if (gravity_sigma >= 0.0) {
-    ep.window.gravity_sigma_deg = gravity_sigma;
-  }
-  if (inlier_fraction >= 0.0) {
-    ep.visual.min_inlier_fraction = inlier_fraction;
-  }
-  ep.coast_insert_refused = !no_refused_insert;
-  ep.coast_on_pnp = coast_on_pnp;
-  ep.map.recycle_outliers = !no_recycle;
-  ep.window.forget_outliers = !no_forget;
-  if (sfm_window > 0) {
-    ep.init.window_frames = sfm_window;
-  }
-  ep.init.refine_gravity = refine_gravity;
-  ep.init.sfm_bundle_adjust = !no_sfm_ba;
-  ep.init.sfm.triangulate_window = sfm_tri;
-  ep.init.sfm_ba_fix_pair = !sfm_ba_free_pair;
-  if (align_stride > 0) {
-    ep.init.align_stride = align_stride;
-  }
-  if (oracle_bg) {
+  if (o.oracle_bg) {
     ep.init.oracle_gyro_bias = [&](double t, Eigen::Vector3d & bg) {bg = bag.gt.gyroBias(t);};
-  }
-  if (sigma_bg >= 0.0) {
-    ep.sigma_gyro_bias = sigma_bg;
-  }
-  if (visual_init >= 0.0) {
-    ep.visual_init_seconds = visual_init;
-  }
-  if (max_scale_unc >= 0.0) {
-    ep.init.max_scale_uncertainty = max_scale_unc;
-  }
-  if (window_outlier_px >= 0.0) {
-    ep.window.outlier_px = window_outlier_px;
   }
   std::printf(
     "tracker solves refused below an inlier fraction of %.2f\n", ep.visual.min_inlier_fraction);
