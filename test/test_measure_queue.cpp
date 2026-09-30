@@ -51,31 +51,36 @@ int main()
     });
   for (int k = 0; k < count; ++k) {
     glassvio::MeasureGroup group;
-    assert(queue.waitPop(group));
+    const bool ok1 = queue.waitPop(group);
+    assert(ok1);
     assert(group.header.stamp == header(k).stamp && "callbacks reordered frames");
   }
   camera.join();
   imu.join();
   queue.stop();
   glassvio::MeasureGroup group;
-  assert(!queue.waitPop(group));
+  const bool ok2 = queue.waitPop(group);
+  assert(!ok2);
 
   // A stalled worker drops observations but keeps a complete, ordered IMU chain.
   glassvio::MeasureQueue bounded(1);
   bounded.pushImu(sample(0));
   bounded.pushFrame(header(0), {});
-  assert(bounded.waitPop(group));
+  const bool ok3 = bounded.waitPop(group);
+  assert(ok3);
   for (int k = 1; k <= 5; ++k) {
     bounded.pushFrame(header(k * 10 - 5), {});
     bounded.pushImu(sample(k * 10));
   }
   bounded.stop();   // shutdown drains the queued work before returning false.
-  assert(bounded.waitPop(group));
+  const bool ok4 = bounded.waitPop(group);
+  assert(ok4);
   assert(group.header.stamp == header(45).stamp);
   assert(group.imu.size() == 6);
   for (int k = 0; k <= 5; ++k) {
     assert(group.imu[k]->header.stamp == header(k * 10).stamp);
   }
-  assert(!bounded.waitPop(group));
+  const bool ok5 = bounded.waitPop(group);
+  assert(!ok5);
   std::puts("measurement queue: ok");
 }

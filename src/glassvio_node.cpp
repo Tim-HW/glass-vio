@@ -41,6 +41,8 @@ public:
     const std::string image_topic =
       declare_parameter<std::string>("image_topic", "/cam0/image_raw");
     const std::string calib_dir = declare_parameter<std::string>("calib_dir", "config");
+    const int imu_queue_depth = declare_parameter<int>("imu_queue_depth", 400);
+    const int image_queue_depth = declare_parameter<int>("image_queue_depth", 20);
     world_frame_ = declare_parameter<std::string>("world_frame", "odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "imu");
 
@@ -64,7 +66,16 @@ public:
     const int max_features = declare_parameter<int>("features.max", 1000);
     const int min_features = declare_parameter<int>("features.min", 150);
     const int fast_threshold = declare_parameter<int>("features.fast_threshold", 20);
-    tracker_ = std::make_unique<FeatureTracker>(max_features, min_features, fast_threshold);
+    // The VINS-Fusion-style front end (doc/08 §6): off by default -- it cuts ATE by a third on
+    // V1_01/V1_02 but loses V1_03 -- so estimator_check's --top-up / --flow-back / --flow-back-keep
+    // are reachable here too.
+    const int top_up = declare_parameter<int>("features.top_up", 0);
+    const double flow_back_px = declare_parameter<double>("features.flow_back_px", 0.0);
+    const int flow_back_keep = declare_parameter<int>("features.flow_back_keep", 0);
+    const double min_spacing = declare_parameter<double>("features.min_spacing_px", 15.0);
+    tracker_ = std::make_unique<FeatureTracker>(
+      max_features, min_features, fast_threshold, flow_back_px, top_up,
+      static_cast<float>(min_spacing), flow_back_keep);
 
     EstimatorParams ep;
     // TWO SPANS, NOT ONE. `bootstrap_frames` is how much to collect (stage [3]'s bias wants
@@ -72,12 +83,16 @@ public:
     // which must stay short or its landmarks die. Setting them equal starves the bias solve --
     // see EstimatorParams::bootstrap_frames.
     ep.bootstrap_frames = declare_parameter<int>("bootstrap_frames", 120);
-    ep.init.window_frames = declare_parameter<int>("sfm_window_frames", 30);
+    // 20, the initializer's own default and what every estimator_check number is measured with.
+    // This read 30 for a while: measured, a 30-frame window moved V1_03's bootstrap to 57.6 s and
+    // let a 1.8x-wrong scale through (doc/08 §6).
+    ep.init.window_frames = declare_parameter<int>("sfm_window_frames", 20);
     estimator_ = std::make_unique<VioEstimator>(calib_, ep);
 
     // Bounded: if the worker falls behind, drop the OLDEST group rather than let latency grow
     // without bound. A stale pose is useless.
     measurements_ = std::make_unique<MeasureQueue>(declare_parameter<int>("max_queue_size", 3));
+    restart_on_loss_ = declare_parameter<bool>("restart_on_loss", true);
 
     // SEPARATE, MUTUALLY EXCLUSIVE CALLBACK GROUPS. This is what lets the tracker run in the
     // image callback without starving the IMU: on the default single-threaded executor the two
@@ -91,11 +106,18 @@ public:
     rclcpp::SubscriptionOptions image_opts;
     image_opts.callback_group = image_cbg_;
 
+    // RELIABLE, NOT SensorDataQoS. Best effort lets the middleware drop a 360 KB image or an
+    // IMU sample whenever this node is busy -- and nothing here can see that: the drop counter
+    // below covers only the internal queue, which reported zero while the live node lost the
+    // scene 10 s after bootstrap (the offline harness, which reads the bag directly, tracks the
+    // same sequence to the end). A sequential KLT cannot survive a skipped frame (sync.hpp), and
+    // a hole in the IMU fails preintegration outright, so neither stream may be lossy. Depth is
+    // one bootstrap's worth of samples, so a slow attempt queues rather than discards.
     sub_imu_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic, rclcpp::SensorDataQoS(),
+      imu_topic, rclcpp::QoS(rclcpp::KeepLast(imu_queue_depth)).reliable(),
       [this](const sensor_msgs::msg::Imu::ConstSharedPtr msg) {imuCallback(msg);}, imu_opts);
     sub_image_ = create_subscription<sensor_msgs::msg::Image>(
-      image_topic, rclcpp::SensorDataQoS(),
+      image_topic, rclcpp::QoS(rclcpp::KeepLast(image_queue_depth)).reliable(),
       [this](const sensor_msgs::msg::Image::ConstSharedPtr msg) {imageCallback(msg);},
       image_opts);
 
@@ -124,7 +146,32 @@ private:
 
   void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr & msg)
   {
+    warnGap("imu", stampOf(msg->header), imu_last_t_, imu_min_dt_);
     warnDropped(measurements_->pushImu(msg));
+  }
+
+  static double stampOf(const std_msgs::msg::Header & h)
+  {
+    return static_cast<double>(h.stamp.sec) + h.stamp.nanosec * 1e-9;
+  }
+
+  /// A stream that skips a sample says so HERE, where the gap is still attributable. Anything
+  /// lost in the middleware is invisible to the queue's own drop counter, and the estimator only
+  /// meets it later as a failed preintegration or a KLT jump.
+  void warnGap(const char * what, double t, double & last, double & min_dt)
+  {
+    const double dt = t - last;
+    if (last > 0.0 && dt > 0.0) {
+      if (min_dt <= 0.0 || dt < min_dt) {
+        min_dt = dt;
+      } else if (dt > 1.8 * min_dt) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "%s stream gap: %.1f ms against %.1f ms nominal -- samples lost in transport",
+          what, dt * 1e3, min_dt * 1e3);
+      }
+    }
+    last = t;
   }
 
   /// Tracks HERE, not in the worker: the queue may drop a group, and a sequential KLT cannot
@@ -140,6 +187,7 @@ private:
     }
 
     // tracker_ is touched only here, and this group is MutuallyExclusive, so no lock.
+    warnGap("image", stampOf(msg->header), image_last_t_, image_min_dt_);
     FeatureTracker::Result r = tracker_->track(cv->image);
     publishFeatures(msg->header, cv->image, r);
 
@@ -210,11 +258,17 @@ private:
         break;
 
       case FrameResult::Stage::Lost:
-        // Loss is terminal for this run; restart the node to collect a new bootstrap.
+        // A loss used to be terminal -- the node published nothing ever after and asked to be
+        // restarted by hand. VINS-Fusion detects failure and re-initializes; so do we: reset and
+        // collect a new bootstrap, since the estimator already knows how (VioEstimator::reset).
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "LOST -- only %d landmarks in view. With the map maintained this means the tracker "
-          "lost the scene, not that we outlived a frozen set.", r.features);
+          "lost the scene, not that we outlived a frozen set.%s", r.features,
+          restart_on_loss_ ? " Resetting to collect a new bootstrap." : "");
+        if (restart_on_loss_) {
+          estimator_->reset();
+        }
         return;
 
       case FrameResult::Stage::Tracking:
@@ -278,6 +332,12 @@ private:
   std::unique_ptr<VioEstimator> estimator_;
 
   std::string world_frame_, body_frame_;
+  bool restart_on_loss_ = true;
+  // Stream continuity, per topic: the smallest interval seen so far, and the last stamp.
+  double imu_last_t_ = 0.0;
+  double imu_min_dt_ = 0.0;
+  double image_last_t_ = 0.0;
+  double image_min_dt_ = 0.0;
   rclcpp::CallbackGroup::SharedPtr imu_cbg_, image_cbg_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;

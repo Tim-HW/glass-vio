@@ -5,6 +5,13 @@
 #   ./run_euroc.sh rviz:=false           # headless (RViz competes for CPU; use this for numbers)
 #   ./run_euroc.sh bag:=/path/to/other_ros2
 #
+# THE DEFAULTS ARE THE MEASURED BEST ACROSS EuRoC V1_01, V1_02 AND V1_03 (doc/08 §6): every
+# sequence tracked to the end, RMS ATE 0.106 / 0.161 / 0.254 m on the deterministic harness.
+# For V1_01 alone the VINS-Fusion-style front end is better (0.073 m) -- but it loses V1_03:
+#   ./run_euroc.sh top_up:=400 flow_back_px:=0.5 flow_back_keep:=30
+# The node drops frames when the worker falls behind, so live numbers trail the harness; if the
+# bootstrap is slow to arrive, rate:=0.5 gives the worker time.
+#
 # RViz shows the odom trajectory, the TF (gravity-aligned world frame), and the feature
 # overlay. It is DEFAULT ON here because this script is the interactive/watch entry point; the
 # launch file itself defaults RViz off, so a headless or CI `ros2 launch` stays clean.

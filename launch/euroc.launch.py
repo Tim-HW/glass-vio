@@ -26,6 +26,9 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BAG = os.path.join(HERE, 'data', 'vicon_room1', 'V1_01_easy', 'V1_01_easy_ros2')
 CALIB = os.path.join(HERE, 'config')
 RVIZ = os.path.join(HERE, 'rviz', 'glassvio.rviz')
+SNAP_ENV_CLEAN = 'env ' + ' '.join('-u ' + v for v in (
+    'GTK_PATH', 'GTK_IM_MODULE_FILE', 'GTK_MODULES', 'GDK_PIXBUF_MODULE_FILE',
+    'GDK_PIXBUF_MODULEDIR', 'GIO_MODULE_DIR', 'GTK_EXE_PREFIX', 'LOCPATH'))
 
 
 def generate_launch_description():
@@ -34,6 +37,10 @@ def generate_launch_description():
     # value_type is load-bearing: a substitution is a string, and the node declares this as an
     # int -- an unwrapped LaunchConfiguration throws InvalidParameterType.
     bootstrap = ParameterValue(LaunchConfiguration('bootstrap_frames'), value_type=int)
+    sfm_window = ParameterValue(LaunchConfiguration('sfm_window_frames'), value_type=int)
+    top_up = ParameterValue(LaunchConfiguration('top_up'), value_type=int)
+    flow_back = ParameterValue(LaunchConfiguration('flow_back_px'), value_type=float)
+    flow_back_keep = ParameterValue(LaunchConfiguration('flow_back_keep'), value_type=int)
 
     return LaunchDescription([
         DeclareLaunchArgument('bag', default_value=BAG),
@@ -48,6 +55,20 @@ def generate_launch_description():
             description='Frames collected before attempting the bootstrap. Must span real '
                         'translation: a rotating MAV gives stage [2] no baseline, and the '
                         'window slides on until it finds one.'),
+        DeclareLaunchArgument(
+            'sfm_window_frames', default_value='20',
+            description='Frames the bootstrap reconstructs and aligns over. 20 is what every '
+                        'estimator_check result is measured with (doc/08 §6).'),
+        DeclareLaunchArgument(
+            'top_up', default_value='0',
+            description='Refill the tracker to this many tracks on every frame (0 = only when '
+                        'fewer than 150 remain). 400 is the measured best on V1_01/V1_02.'),
+        DeclareLaunchArgument(
+            'flow_back_px', default_value='0.0',
+            description='Forward-backward KLT check in pixels (0 = off). 0.5 with top_up:=400.'),
+        DeclareLaunchArgument(
+            'flow_back_keep', default_value='0',
+            description='Skip that check on a frame where fewer than this many tracks pass it.'),
         Node(
             package='glassvio',
             executable='glassvio_node',
@@ -61,6 +82,10 @@ def generate_launch_description():
                 'image_topic': '/cam0/image_raw',
                 'calib_dir': CALIB,
                 'bootstrap_frames': bootstrap,
+                'sfm_window_frames': sfm_window,
+                'features.top_up': top_up,
+                'features.flow_back_px': flow_back,
+                'features.flow_back_keep': flow_back_keep,
                 'world_frame': 'odom',
                 'body_frame': 'imu',
             }],
@@ -77,6 +102,12 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             arguments=['-d', RVIZ],
+            # A snap-packaged editor's terminal (VS Code snap) leaks GTK_PATH into every child;
+            # RViz then loads the snap's GTK module, which drags in /snap/core20's libpthread and
+            # dies with `symbol lookup error ... GLIBC_PRIVATE`. Measured: clearing GTK_PATH alone
+            # fixes it; the rest are cleared as run_euroc.sh does. Here, so a bare `ros2 launch`
+            # is covered too.
+            prefix=SNAP_ENV_CLEAN,
             output='log',
             condition=IfCondition(LaunchConfiguration('rviz')),
         ),

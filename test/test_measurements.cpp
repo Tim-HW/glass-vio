@@ -33,7 +33,8 @@ int main()
     imu.add({t, zero, Eigen::Vector3d(2.0, 0.0, 0.0)});
   }
   glass_core::ImuPreintegration pre(zero, zero, 1e-3, 1e-2);
-  assert(imu.preintegrate(0.005, 0.024, zero, zero, pre));
+  const bool ok1 = imu.preintegrate(0.005, 0.024, zero, zero, pre);
+  assert(ok1);
   assert(std::abs(pre.dt() - 0.019) < 1e-12 && "clip both IMU interval boundaries");
   assert(std::abs(pre.dv().x() - 0.038) < 1e-12);
   assert(std::abs(pre.dp().x() - 0.000361) < 1e-12);
@@ -48,7 +49,8 @@ int main()
   for (double t : {0.0, 0.01, 0.05, 0.06}) {
     gap.add({t, zero, zero});
   }
-  assert(!gap.preintegrate(0.005, 0.055, zero, zero, pre));
+  const bool ok2 = gap.preintegrate(0.005, 0.055, zero, zero, pre);
+  assert(!ok2);
   assert(!gap.continuous(0.005, 0.055));
   assert(!gap.preintegrate(0.02, 0.03, zero, zero, pre) && "gap straddles the query");
 
@@ -76,7 +78,8 @@ int main()
   for (const auto & m : group.imu) {
     online.add({m->header.stamp.nanosec * 1e-9, zero, Eigen::Vector3d(2.0, 0.0, 0.0)});
   }
-  assert(online.preintegrate(0.005, 0.024, zero, zero, pre));
+  const bool ok3 = online.preintegrate(0.005, 0.024, zero, zero, pre);
+  assert(ok3);
   assert(std::abs(pre.dt() - 0.019) < 1e-12);
   std::puts("measurement intervals: ok");
 }

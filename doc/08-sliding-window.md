@@ -19,8 +19,12 @@ Code target: [`vio_estimator.cpp`](../src/vio/vio_estimator.cpp),
 
 ## 1. Where we are — measured
 
-A working monocular VIO on the ROS node: bootstraps at true metric scale, tracks ~20–30 s on EuRoC
-V1_01, maintains a sliding-window landmark map live, publishes odom + TF. The unit suites are green;
+A working monocular VIO on the ROS node: bootstraps at true metric scale, tracks EuRoC V1_01 live
+from its 17 s bootstrap to the end of the bag at 1x playback, maintains a sliding-window landmark
+map, publishes odom + TF. (It used to lose the scene ~10 s after bootstrapping: the subscriptions
+were best-effort, so the middleware silently dropped images and IMU samples under load — a
+sequential KLT cannot survive a skipped frame. Reliable QoS fixed it; a loss now resets and
+re-bootstraps instead of ending the run.) The unit suites are green;
 the offline thesis check `vio_check` is 0.036 m. On the deterministic harness:
 
 | metric | per-frame tracker alone | **today's default** (§6) |
