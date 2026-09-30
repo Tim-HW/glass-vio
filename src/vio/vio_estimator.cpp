@@ -38,6 +38,15 @@ void VioEstimator::reset()
   vis_active_ = false;
   vis_frames_.clear();
   vis_sfm_ = SfmWindow();
+  // The next bootstrap DEFINES the world afresh, so it must not inherit the last run's gravity
+  // (which the window may have re-estimated), its retry phase, or its diagnostics. Latent until
+  // the node started calling reset() on a loss.
+  gravity_world_ = Eigen::Vector3d(0.0, 0.0, -kGravity);
+  since_attempt_ = 0;
+  last_failure_.clear();
+  last_landmarks_ = 0;
+  last_bias_pairs_ = 0;
+  last_window_ = WindowResult();
 }
 
 // =================================================================================

@@ -174,6 +174,7 @@ void LandmarkMap::insert(
     stats_.parallax += tri == TriResult::Parallax;
     if (tri == TriResult::Ok) {
       stats_.recycled += was_outlier;
+      dropped_outliers_.erase(id);   // a landmark again; a second drop marks it afresh
       landmarks_.emplace(id, X);
       last_seen_[id] = frame_;
       pending_.erase(id);
@@ -202,6 +203,9 @@ void LandmarkMap::insert(
     const auto seen = last_seen_.find(it->first);
     if (seen == last_seen_.end() || frame_ - seen->second > p_.max_unseen_frames * 4) {
       last_seen_.erase(it->first);
+      // The tracker lost this id for good: nothing left to recycle, and the set of ids ever
+      // dropped as outliers must not grow for the life of the run.
+      dropped_outliers_.erase(it->first);
       ++stats_.expired;
       it = pending_.erase(it);
     } else {
