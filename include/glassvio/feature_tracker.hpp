@@ -40,6 +40,11 @@ struct FeatureTrackerParams
   /// of waiting for them to fall below min_features. 0 = the floor rule.
   int top_up_target = 0;
   float min_spacing_px = 15.0f;   ///< minimum distance between a new corner and a live track
+  /// Two tracks that flow onto the same corner are ONE feature counted twice: min_spacing_px
+  /// only keeps NEW corners apart, nothing stops live ones converging. Within this many pixels
+  /// the younger track is dropped and the older keeps its id (VINS-Fusion's setMask keeps the
+  /// longest-tracked). 0 = off.
+  float merge_px = 0.0f;
 };
 
 class FeatureTracker
@@ -57,6 +62,9 @@ public:
     lk_criteria_(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01)
   {
   }
+
+  /// Tracks dropped so far because they had converged onto an older one (merge_px).
+  std::size_t merged() const {return merged_;}
 
   /// Feed one GRAYSCALE frame. Returns the live tracks (points + ids) in this frame.
   Result track(const cv::Mat & gray)
@@ -85,6 +93,7 @@ public:
       // fix is NOT here -- it is a higher floor or a map-driven re-detect that leaves the
       // reconstruction's tracks intact. Supply the map without breaking the geometry it is
       // built on.
+      mergeDuplicates(tracked, tracked_ids);
       const std::size_t floor = static_cast<std::size_t>(
         p_.top_up_target > 0 ? p_.top_up_target : p_.min_features);
       if (tracked.size() < floor) {
@@ -161,6 +170,31 @@ private:
   /// Detect FAST corners in `gray`, keep the strongest, and append those that are not within
   /// kMinSpacing of a feature already in `pts` (surviving tracks plus corners accepted so far
   /// this call). Each kept corner gets a fresh id.
+  /// Drop the YOUNGER of any two tracks closer than merge_px. Ids only ever grow, and flow()
+  /// preserves order, so the arrays are oldest-first: keep a track unless an already-kept one
+  /// sits on top of it.
+  void mergeDuplicates(std::vector<cv::Point2f> & pts, std::vector<long> & ids)
+  {
+    if (p_.merge_px <= 0.0f) {
+      return;
+    }
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < pts.size(); ++i) {
+      bool duplicate = false;
+      for (std::size_t j = 0; j < kept && !duplicate; ++j) {
+        duplicate = cv::norm(pts[i] - pts[j]) < p_.merge_px;
+      }
+      if (!duplicate) {
+        pts[kept] = pts[i];
+        ids[kept] = ids[i];
+        ++kept;
+      }
+    }
+    merged_ += pts.size() - kept;
+    pts.resize(kept);
+    ids.resize(kept);
+  }
+
   std::size_t cap() const
   {
     return static_cast<std::size_t>(p_.top_up_target > 0 ? p_.top_up_target : p_.max_features);
@@ -206,6 +240,7 @@ private:
   std::vector<cv::Point2f> prev_pts_;
   std::vector<long> ids_;
   long next_id_ = 0;
+  std::size_t merged_ = 0;
 };
 
 }  // namespace glassvio

@@ -225,6 +225,8 @@ const std::vector<Flag> & flags()
       [](O & o, S v) {o.data.top_up_target = nonnegativeInteger(v);}},
     {"--min-spacing", "PX", "minimum distance between a new corner and a live track (15)",
       [](O & o, S v) {o.data.min_spacing_px = static_cast<float>(nonnegativeNumber(v));}},
+    {"--merge-px", "PX", "drop the younger of two tracks closer than PX (0 = off)",
+      [](O & o, S v) {o.data.merge_px = static_cast<float>(nonnegativeNumber(v));}},
     {"--flow-back", "PX", "keep a track only if flowing it back lands within PX (0 = off)",
       [](O & o, S v) {o.data.flow_back_px = nonnegativeNumber(v);}},
     {"--flow-back-keep", "N", "skip that check on a frame where fewer than N tracks pass it",
@@ -332,6 +334,12 @@ int main(int argc, char ** argv)
   std::printf(
     "deterministic drive: %zu frames, %zu imu, %zu gt\n",
     bag.frames.size(), bag.imu.size(), bag.gt.size());
+  if (o.data.merge_px > 0.0f) {
+    std::printf(
+      "tracker merged %zu duplicate tracks closer than %.1f px (%.2f a frame)\n",
+      bag.tracks_merged, o.data.merge_px,
+      static_cast<double>(bag.tracks_merged) / static_cast<double>(bag.frames.size()));
+  }
 
   // What needs the loaded bag: the oracles read the ground truth.
   if (mode != "est-ba") {

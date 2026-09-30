@@ -614,10 +614,38 @@ the checked tracker are down to 0–16 features a frame, and whether the run sur
 handful of marginal tracks. That is the difficult sequence's fast, blurred motion at the edge of
 what this tracker can follow — a threshold will not move it.
 
-**So what is next** for the front end is to follow fast motion rather than filter it: predict each
-track's position from the gyro before KLT (VINS-Fusion's `predictPtsInNextFrame` with
-`OPTFLOW_USE_INITIAL_FLOW`), so fast rotation stops costing tracks. Then this set is worth measuring
-again. Stage B marginalization remains the other lever.
+**Merging duplicate tracks — built, measured, off — and what the sweep exposed.** Nothing stops two
+KLT tracks flowing onto the same corner (`min_spacing_px` only spaces *new* ones), so
+`FeatureTrackerParams::merge_px` drops the younger of two tracks closer than a threshold, as
+VINS-Fusion's mask does (`--merge-px=PX`). Collisions turn out to be rare — one merge every ten
+frames at 2 px, ~200 a sequence. The first result looked like a win (V1_01 0.106 → 0.082 m,
+V1_02 0.161 → 0.120 m), so the threshold was swept:
+
+| `--merge-px` | 0 | 1 | 1.5 | 2 | 2.5 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|---|---|
+| V1_01 ATE (m) | 0.106 | 0.091 | 0.074 | 0.082 | 0.078 | 0.087 | 0.099 | 0.091 |
+| V1_02 | 0.161 | **fails 18.8 s** | **fails 19.8 s** | 0.120 | **fails 26.5 s** | 0.174 | **fails 18.7 s** | **fails 19.6 s** |
+| V1_03 | 0.254 | 0.280 | fails 99.8 s | 0.289 | fails 97.1 s | 0.236 | **fails 42.0 s** | 0.344 |
+
+A change that touches one track in ten frames flips V1_02 between 0.12 m and diverging two seconds
+after its bootstrap, threshold by threshold, with no trend. That is not the merge; that is the
+sequence. **V1_02's default result is one good outcome of a fragile start** — it bootstraps 18%
+slow (speed ratio 0.82) and whether the keyframe window pulls the scale in or loses it is decided
+by a handful of tracks. Only V1_01 is stable enough to read a small effect from (every merge
+setting beats none, 0.074–0.099 against 0.106 m).
+
+`★ Insight — one run is not a measurement ───────`
+Eight nearly identical configurations gave V1_02 three passes and five failures. Every single-run
+comparison on V1_02 and V1_03 earlier in this section — the front-end set, the flow-back check, the
+bootstrap variants — sits under that noise floor. On a chaotic sequence the unit of evidence is a
+*distribution* over small perturbations, not a number. Sweep a nuisance parameter before believing
+a gain, and before believing a loss.
+`─────────────────────────────────────────────────`
+
+**So what is next** is robustness, not another front-end knob: make V1_02's first seconds after
+bootstrap hold across that sweep (the under-scaled start is the prime suspect), and score changes
+on V1_02/V1_03 by pass rate over a perturbation sweep. Gyro-predicted KLT and Stage B
+marginalization remain the accuracy levers once that floor is known.
 
 ### Stage B — marginalization (only if Stage A's dropped-oldest loss matters)
 
@@ -730,7 +758,7 @@ $\lVert\mathbf{v}\rVert/\lVert\mathbf{v}_{\text{gt}}\rVert$ while tracking.
                                  [--sfm-tri] [--sfm-ba-free-pair] [--align-stride=N] \
                                  [--max-scale-unc=X] [--visual-init=S] \
                                  [--oracle-bg] [--sigma-bg=X] [--flow-back=PX] \
-                                 [--flow-back-keep=N] [--top-up=N] [--min-spacing=PX]
+                                 [--flow-back-keep=N] [--top-up=N] [--min-spacing=PX] [--merge-px=PX]
 ./build/glassvio/vio_check           # the offline tight-coupling thesis check
 ./run_euroc.sh                       # the node, live, with RViz
 colcon test --packages-select glassvio   # the six suites: glass_core's four + reprojection + tracker

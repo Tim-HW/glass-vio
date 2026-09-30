@@ -224,6 +224,7 @@ struct DatasetOptions
   double flow_back_px = 0.0;   ///< FeatureTracker forward-backward check (--flow-back=PX)
   int top_up_target = 0;       ///< FeatureTracker per-frame refill target (--top-up=N)
   float min_spacing_px = 15.0f;   ///< FeatureTracker corner spacing (--min-spacing=PX)
+  float merge_px = 0.0f;          ///< FeatureTracker duplicate-track merge (--merge-px=PX)
   int flow_back_min_keep = 0;     ///< skip the flow-back check below this many (--flow-back-keep=N)
 };
 
@@ -248,6 +249,7 @@ public:
   ImuBuffer imu;
   GroundTruth gt;
   std::vector<SfmFrame> frames;   ///< populated only when Options::track_images
+  std::size_t tracks_merged = 0;  ///< FeatureTracker::merged() over the whole sequence
 
   /// `gt_csv` may be empty -- the sensors load without it, for a run with no oracle.
   static EurocDataset load(
@@ -270,6 +272,7 @@ public:
     tp.flow_back_min_keep = opts.flow_back_min_keep;
     tp.top_up_target = opts.top_up_target;
     tp.min_spacing_px = opts.min_spacing_px;
+    tp.merge_px = opts.merge_px;
     FeatureTracker tracker(tp);
     int n_frames = 0;
 
@@ -312,6 +315,7 @@ public:
         ++n_frames;
       }
     }
+    out.tracks_merged = tracker.merged();
     return out;
   }
 
