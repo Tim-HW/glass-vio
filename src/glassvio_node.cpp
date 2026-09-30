@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -147,13 +148,51 @@ private:
 
   void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr & msg)
   {
-    warnGap("imu", stampOf(msg->header), imu_last_t_, imu_min_dt_);
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!acceptStamp("imu", stampOf(msg->header), imu_last_t_, imu_min_dt_,
+      imu_waiting_for_restart_, image_waiting_for_restart_, image_last_t_))
+    {
+      return;
+    }
     warnDropped(measurements_->pushImu(msg));
   }
 
   static double stampOf(const std_msgs::msg::Header & h)
   {
     return static_cast<double>(h.stamp.sec) + h.stamp.nanosec * 1e-9;
+  }
+
+  // Called with state_mutex_ held. A >1 s rewind means a replay restart; smaller
+  // inversions are stale messages and must not disturb the estimator or KLT.
+  bool acceptStamp(
+    const char * what, double t, double & last, double & min_dt,
+    bool & waiting, bool & other_waiting, double other_last)
+  {
+    constexpr double kRestartJumpSec = 1.0;
+    if (waiting) {
+      if (last - t < kRestartJumpSec) {return false;}
+      waiting = false;
+      min_dt = 0.0;
+      last = t;
+      RCLCPP_WARN(get_logger(), "%s stream joined new bag timeline", what);
+      return true;
+    }
+    if (last > 0.0 && t < last) {
+      if (last - t < kRestartJumpSec) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "%s out-of-order timestamp; dropping sample", what);
+        return false;
+      }
+      measurements_->reset();
+      tracker_reset_pending_ = true;
+      other_waiting = other_last > 0.0;
+      min_dt = 0.0;
+      last = t;
+      RCLCPP_WARN(get_logger(), "%s timestamp jumped back; resetting for bag restart", what);
+      return true;
+    }
+    warnGap(what, t, last, min_dt);
+    return true;
   }
 
   /// A stream that skips a sample says so HERE, where the gap is still attributable. Anything
@@ -188,7 +227,20 @@ private:
     }
 
     // tracker_ is touched only here, and this group is MutuallyExclusive, so no lock.
-    warnGap("image", stampOf(msg->header), image_last_t_, image_min_dt_);
+    std::size_t epoch;
+    bool reset_tracker;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!acceptStamp("image", stampOf(msg->header), image_last_t_, image_min_dt_,
+        image_waiting_for_restart_, imu_waiting_for_restart_, imu_last_t_))
+      {
+        return;
+      }
+      epoch = measurements_->epoch();
+      reset_tracker = tracker_reset_pending_;
+      tracker_reset_pending_ = false;
+    }
+    if (reset_tracker) {tracker_->reset();}
     FeatureTracker::Result r = tracker_->track(cv->image);
     publishFeatures(msg->header, cv->image, r);
 
@@ -198,7 +250,14 @@ private:
     // feature moves 155 px. A no-op on a rectified stream.
     r.points = calib_.undistort(r.points);
 
-    warnDropped(measurements_->pushFrame(msg->header, std::move(r)));
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (epoch != measurements_->epoch()) {
+        tracker_reset_pending_ = true;
+        return;
+      }
+      warnDropped(measurements_->pushFrame(msg->header, std::move(r)));
+    }
   }
 
   void publishFeatures(
@@ -230,14 +289,24 @@ private:
   void workerLoop()
   {
     MeasureGroup group;
-    while (measurements_->waitPop(group)) {
-      handleFrame(group);
+    std::size_t worker_epoch = measurements_->epoch();
+    std::size_t group_epoch;
+    while (measurements_->waitPop(group, &group_epoch)) {
+      if (group_epoch != worker_epoch) {
+        estimator_->reset();
+        worker_epoch = group_epoch;
+      }
+      handleFrame(group, group_epoch);
     }
   }
 
-  void handleFrame(const MeasureGroup & group)
+  void handleFrame(const MeasureGroup & group, std::size_t epoch)
   {
     const FrameResult r = estimator_->process(group);
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (epoch != measurements_->epoch()) {
+      return;  // A restart happened while the estimator was processing this frame.
+    }
 
     switch (r.stage) {
       case FrameResult::Stage::Collecting:
@@ -334,6 +403,11 @@ private:
 
   std::string world_frame_, body_frame_;
   bool restart_on_loss_ = true;
+  // Shared by the two callbacks and the worker's final epoch/output check.
+  std::mutex state_mutex_;
+  bool imu_waiting_for_restart_ = false;
+  bool image_waiting_for_restart_ = false;
+  bool tracker_reset_pending_ = false;
   // Stream continuity, per topic: the smallest interval seen so far, and the last stamp.
   double imu_last_t_ = 0.0;
   double imu_min_dt_ = 0.0;
