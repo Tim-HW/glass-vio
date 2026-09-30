@@ -66,6 +66,14 @@ public:
   /// Tracks dropped so far because they had converged onto an older one (merge_px).
   std::size_t merged() const {return merged_;}
 
+  /// Start a new image timeline without reusing landmark IDs still in flight.
+  void reset()
+  {
+    prev_gray_.release();
+    prev_pts_.clear();
+    ids_.clear();
+  }
+
   /// Feed one GRAYSCALE frame. Returns the live tracks (points + ids) in this frame.
   Result track(const cv::Mat & gray)
   {

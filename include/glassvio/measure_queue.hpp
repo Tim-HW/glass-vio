@@ -2,6 +2,7 @@
 #define GLASSVIO_MEASURE_QUEUE_HPP
 
 #include <algorithm>
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -44,14 +45,30 @@ public:
   }
 
   /// Wait for work, or return false once shutdown has drained the queue.
-  bool waitPop(MeasureGroup & out)
+  bool waitPop(MeasureGroup & out, std::size_t * epoch = nullptr)
   {
     std::unique_lock<std::mutex> lock(mutex_);
     ready_.wait(lock, [this] {return stopped_ || !queue_.empty();});
     if (queue_.empty()) {return false;}
     out = std::move(queue_.front());
     queue_.pop_front();
+    if (epoch) {*epoch = epoch_;}
     return true;
+  }
+
+  /// Discard all observations from the previous bag timeline.
+  void reset()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sync_.clear();
+    queue_.clear();
+    ++epoch_;
+  }
+
+  std::size_t epoch() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return epoch_;
   }
 
   void stop()
@@ -94,7 +111,8 @@ private:
   std::deque<MeasureGroup> queue_;
   std::size_t capacity_;
   bool stopped_ = false;
-  std::mutex mutex_;
+  std::size_t epoch_ = 0;
+  mutable std::mutex mutex_;
   std::condition_variable ready_;
 };
 

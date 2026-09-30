@@ -79,5 +79,12 @@ int main()
   assert(common > c.ids.size() / 2 && "IDs must persist below the floor too");
   assert(moved > common * 9 / 10 && "survivors below the floor must be FLOWED, not frozen");
   std::printf("ok: below the floor, %zu/%zu survivors followed the 3 px shift\n", moved, common);
+
+  tracker.reset();
+  const auto fresh = tracker.track(makeScene(30));
+  assert(fresh.points.size() > 150);
+  for (long id : fresh.ids) {
+    assert(!ids_b.count(id) && "restart must not carry tracks across bag timelines");
+  }
   return 0;
 }

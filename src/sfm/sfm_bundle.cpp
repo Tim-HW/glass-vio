@@ -40,13 +40,13 @@ SfmBundleStats bundleAdjust(
   constexpr double kMinDepth = 1e-6;   // ruler units; cheirality, not a distance gate
 
   std::vector<int> frame_ids;
-  std::unordered_map<int, NavState> x;
+  std::unordered_map<int, NavState> camera_states;
   for (const auto & kv : w.pose) {
     const Eigen::Isometry3d T_c0_ck = kv.second.inverse();
     NavState s;
     s.R = Sophus::SO3d(Sophus::SO3d::fitToSO3(T_c0_ck.linear()));
     s.p = T_c0_ck.translation();
-    x.emplace(kv.first, s);
+    camera_states.emplace(kv.first, s);
     frame_ids.push_back(kv.first);
   }
   std::sort(frame_ids.begin(), frame_ids.end());
@@ -59,13 +59,13 @@ SfmBundleStats bundleAdjust(
   }
 
   std::vector<long> ids;
-  std::vector<Eigen::Vector3d> X;
+  std::vector<Eigen::Vector3d> landmarks;
   for (const auto & kv : w.landmark) {
     ids.push_back(kv.first);
-    X.push_back(kv.second);
+    landmarks.push_back(kv.second);
   }
   std::vector<Obs> obs;
-  std::vector<int> seen(ids.size(), 0);
+  std::vector<int> observation_count(ids.size(), 0);
   for (int k : frame_ids) {
     for (std::size_t l = 0; l < ids.size(); ++l) {
       const auto it = frames[k].by_id.find(ids[l]);
@@ -76,11 +76,11 @@ SfmBundleStats bundleAdjust(
       obs.push_back(
         {fi == free_index.end() ? -1 : fi->second, k, static_cast<int>(l),
           Eigen::Vector2d(it->second.x, it->second.y)});
-      ++seen[l];
+      ++observation_count[l];
     }
   }
-  const int P = static_cast<int>(free_index.size());
-  const int L = static_cast<int>(ids.size());
+  const int free_pose_count = static_cast<int>(free_index.size());
+  const int landmark_count = static_cast<int>(ids.size());
   if (obs.empty()) {
     return stats;
   }
@@ -114,27 +114,27 @@ SfmBundleStats bundleAdjust(
     };
 
   std::vector<double> px;
-  double cost = evaluate(x, X, &px);
+  double cost = evaluate(camera_states, landmarks, &px);
   stats.median_px_before = median(px);
   stats.median_px_after = stats.median_px_before;
   double lambda = 1e-3;
 
   for (int it = 0; it < max_iterations; ++it) {
     // --- Normal equations. H_pp is block-diagonal: an observation touches ONE camera.
-    std::vector<Eigen::Matrix<double, 6, 6>> H_pp(P, Eigen::Matrix<double, 6, 6>::Zero());
-    std::vector<Eigen::Matrix<double, 6, 1>> b_p(P, Eigen::Matrix<double, 6, 1>::Zero());
-    std::vector<Eigen::Matrix3d> H_ll(L, Eigen::Matrix3d::Zero());
-    std::vector<Eigen::Vector3d> b_l(L, Eigen::Vector3d::Zero());
+    std::vector<Eigen::Matrix<double, 6, 6>> H_pp(free_pose_count, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_p(free_pose_count, Eigen::Matrix<double, 6, 1>::Zero());
+    std::vector<Eigen::Matrix3d> H_ll(landmark_count, Eigen::Matrix3d::Zero());
+    std::vector<Eigen::Vector3d> b_l(landmark_count, Eigen::Vector3d::Zero());
     std::vector<Eigen::Matrix<double, 6, 3>> H_pl(obs.size(), Eigen::Matrix<double, 6, 3>::Zero());
 
     for (std::size_t n = 0; n < obs.size(); ++n) {
       const Obs & o = obs[n];
-      if (seen[o.landmark] < 2) {
+      if (observation_count[o.landmark] < 2) {
         continue;
       }
-      const NavState & s = x.at(o.frame);
+      const NavState & s = camera_states.at(o.frame);
       Eigen::Vector3d P_i, P_c;
-      if (!landmarkInCamera(s, X[o.landmark], cam.T_cam_imu, kMinDepth, P_i, P_c)) {
+      if (!landmarkInCamera(s, landmarks[o.landmark], cam.T_cam_imu, kMinDepth, P_i, P_c)) {
         continue;
       }
       const PixelResidual r = reprojectionResidual(P_c, o.z, cam);
@@ -154,22 +154,22 @@ SfmBundleStats bundleAdjust(
     }
 
     // --- Levenberg-Marquardt damping, then eliminate each landmark: S dp = rhs.
-    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(6 * P, 6 * P);
-    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(6 * P);
-    for (int i = 0; i < P; ++i) {
+    Eigen::MatrixXd S = Eigen::MatrixXd::Zero(6 * free_pose_count, 6 * free_pose_count);
+    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(6 * free_pose_count);
+    for (int i = 0; i < free_pose_count; ++i) {
       Eigen::Matrix<double, 6, 6> Hd = H_pp[i];
       Hd.diagonal() += lambda * (Hd.diagonal().array() + 1e-9).matrix();
       S.block<6, 6>(6 * i, 6 * i) = Hd;
       rhs.segment<6>(6 * i) = b_p[i];
     }
-    std::vector<Eigen::Matrix3d> H_ll_inv(L, Eigen::Matrix3d::Zero());
-    std::vector<std::vector<std::size_t>> obs_of(L);
+    std::vector<Eigen::Matrix3d> H_ll_inv(landmark_count, Eigen::Matrix3d::Zero());
+    std::vector<std::vector<std::size_t>> obs_of(landmark_count);
     for (std::size_t n = 0; n < obs.size(); ++n) {
       if (obs[n].pose >= 0 && !H_pl[n].isZero()) {
         obs_of[obs[n].landmark].push_back(n);
       }
     }
-    for (int l = 0; l < L; ++l) {
+    for (int l = 0; l < landmark_count; ++l) {
       Eigen::Matrix3d Hd = H_ll[l];
       if (Hd.isZero()) {
         continue;
@@ -188,32 +188,32 @@ SfmBundleStats bundleAdjust(
         }
       }
     }
-    const Eigen::VectorXd dp = P > 0 ? Eigen::VectorXd(S.ldlt().solve(rhs)) : Eigen::VectorXd();
+    const Eigen::VectorXd dp = free_pose_count > 0 ? Eigen::VectorXd(S.ldlt().solve(rhs)) : Eigen::VectorXd();
     if (!dp.allFinite()) {
       break;
     }
 
     // --- Back-substitute and try the step.
-    std::unordered_map<int, NavState> x_new = x;
+    std::unordered_map<int, NavState> candidate_states = camera_states;
     for (const auto & kv : free_index) {
       NavVec dx = NavVec::Zero();
       dx.segment<3>(kIdxPhi) = dp.segment<3>(6 * kv.second);
       dx.segment<3>(kIdxPos) = dp.segment<3>(6 * kv.second + 3);
-      x_new[kv.first] = boxplus(x.at(kv.first), dx);
+      candidate_states[kv.first] = boxplus(camera_states.at(kv.first), dx);
     }
-    std::vector<Eigen::Vector3d> X_new = X;
-    for (int l = 0; l < L; ++l) {
+    std::vector<Eigen::Vector3d> candidate_landmarks = landmarks;
+    for (int l = 0; l < landmark_count; ++l) {
       Eigen::Vector3d rl = b_l[l];
       for (std::size_t a : obs_of[l]) {
         rl -= H_pl[a].transpose() * dp.segment<6>(6 * obs[a].pose);
       }
-      X_new[l] += H_ll_inv[l] * rl;
+      candidate_landmarks[l] += H_ll_inv[l] * rl;
     }
-    const double cost_new = evaluate(x_new, X_new, nullptr);
+    const double cost_new = evaluate(candidate_states, candidate_landmarks, nullptr);
     ++stats.iterations;
     if (cost_new < cost) {
-      x = std::move(x_new);
-      X = std::move(X_new);
+      camera_states = std::move(candidate_states);
+      landmarks = std::move(candidate_landmarks);
       const double gain = (cost - cost_new) / std::max(cost, 1e-12);
       cost = cost_new;
       lambda = std::max(lambda / 10.0, 1e-7);
@@ -231,29 +231,29 @@ SfmBundleStats bundleAdjust(
   // Free pair frame: the scale was left to the damping, so restore the ruler -- the pair's
   // distance from the base (which sits at the origin) -- by scaling about the origin.
   const double pair_before = w.pose.at(w.second).inverse().translation().norm();
-  const double pair_after = x.at(w.second).p.norm();
+  const double pair_after = camera_states.at(w.second).p.norm();
   if (!fix_pair_frame && pair_after > 1e-12) {
     const double k = pair_before / pair_after;
-    for (auto & kv : x) {
+    for (auto & kv : camera_states) {
       kv.second.p *= k;
     }
-    for (auto & Xl : X) {
+    for (auto & Xl : landmarks) {
       Xl *= k;
     }
   }
 
   px.clear();
-  evaluate(x, X, &px);
+  evaluate(camera_states, landmarks, &px);
   stats.median_px_after = median(px);
 
-  for (const auto & kv : x) {
+  for (const auto & kv : camera_states) {
     Eigen::Isometry3d T_c0_ck = Eigen::Isometry3d::Identity();
     T_c0_ck.linear() = kv.second.R.matrix();
     T_c0_ck.translation() = kv.second.p;
     w.pose[kv.first] = T_c0_ck.inverse();
   }
-  for (int l = 0; l < L; ++l) {
-    w.landmark[ids[l]] = X[l];
+  for (int l = 0; l < landmark_count; ++l) {
+    w.landmark[ids[l]] = landmarks[l];
   }
   return stats;
 }

@@ -82,5 +82,21 @@ int main()
   }
   const bool ok5 = bounded.waitPop(group);
   assert(!ok5);
+
+  // A bag restart discards queued and synchronized observations from the old timeline.
+  glassvio::MeasureQueue restarted(3);
+  restarted.pushImu(sample(1500));
+  restarted.pushFrame(header(1500), {});
+  const auto old_epoch = restarted.epoch();
+  restarted.reset();
+  assert(restarted.epoch() != old_epoch);
+  restarted.pushImu(sample(0));
+  restarted.pushFrame(header(0), {});
+  std::size_t group_epoch = old_epoch;
+  assert(restarted.waitPop(group, &group_epoch));
+  assert(group_epoch == restarted.epoch());
+  assert(group.header.stamp == header(0).stamp);
+  restarted.stop();
+  assert(!restarted.waitPop(group));
   std::puts("measurement queue: ok");
 }

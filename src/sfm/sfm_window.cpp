@@ -155,28 +155,19 @@ bool relativeBodyRotation(
   return true;
 }
 
-SfmWindow buildSfmWindow(
+namespace
+{
+
+SfmWindow selectBasePair(
   const std::vector<SfmFrame> & frames, int begin, int end,
   const CameraCalib & calib, const SfmParams & p)
 {
-  // THE WHOLE RECONSTRUCTION, IN ORDER:
-  //
-  //   A. choose a BASE PAIR -- frame `begin` and one later frame -- and get their relative pose
-  //      from the essential matrix. Its translation has no length, so it is declared to be 1:
-  //      the invented unit ("the ruler") everything below is measured in.
-  //   B. TRIANGULATE landmarks from that pair.
-  //   C. PnP: pose every other frame against those landmarks.
-  //   D. (off by default) triangulate the tracks the base pair did not cover.
-  //
-  // Output convention: w.pose[k] maps a point from the base camera's frame into camera k's
-  // (X_ck = pose[k] * X_c0), so pose[begin] is identity; w.landmark[id] is in the base camera's
-  // frame. bundleAdjust() refines all of it afterwards (sfm_bundle.cpp).
+  // Pixel flow selects candidates; only recovered geometry makes a usable base pair.
   SfmWindow w;
   w.base = begin;
 
   const cv::Mat K_cv = (cv::Mat_<double>(3, 3) <<
     calib.K(0, 0), 0, calib.K(0, 2), 0, calib.K(1, 1), calib.K(1, 2), 0, 0, 1);
-  const Eigen::Matrix3d Kinv = calib.K.inverse();
   const SfmFrame & base = frames[begin];
 
   // --- A + B. THE BASE PAIR: parallax is only a FILTER; the geometry decides.
@@ -285,12 +276,15 @@ SfmWindow buildSfmWindow(
     w.pose[k] = T2;
     break;
   }
-  if (w.second < 0) {
-    return w;   // no frame in the window made a usable pair: the caller slides on and retries
-  }
+  return w;
+}
 
-  // --- C. PnP for the rest. THIS is what propagates the ruler: it consumes landmarks that
-  //        already carry it and returns a pose in the same units.
+void poseRemainingFrames(
+  const std::vector<SfmFrame> & frames, int begin, int end,
+  const CameraCalib & calib, const SfmParams & p, SfmWindow & w)
+{
+  const cv::Mat K_cv = calib.cvK();
+  // PnP carries the base pair's arbitrary ruler into every other camera pose.
   for (int k = begin; k < end; ++k) {
     if (w.pose.count(k)) {
       continue;   // the two base-pair frames already have their poses
@@ -339,9 +333,13 @@ SfmWindow buildSfmWindow(
     }
     w.pose[k] = T;
   }
+}
 
-  // --- D. The rest of the window's tracks (SfmParams::triangulate_window, off by default). Grouped by (first, last) posed frame so each pair is
-  //        one triangulatePoints call; the pair's relative pose is what the base-pair helper wants.
+void addOptionalWindowLandmarks(
+  const std::vector<SfmFrame> & frames, int begin, int end,
+  const CameraCalib & calib, const SfmParams & p, SfmWindow & w)
+{
+  // Group untriangulated tracks by their first and last posed views.
   if (p.triangulate_window) {
     // For every track that is not yet a landmark, find the FIRST and LAST posed frame that see
     // it (the widest baseline available), and group the tracks by that pair of frames.
@@ -405,8 +403,19 @@ SfmWindow buildSfmWindow(
       }
     }
   }
+}
 
-  // A reconstruction is usable only if enough frames were posed for the alignment to work with.
+}  // namespace
+
+SfmWindow buildSfmWindow(
+  const std::vector<SfmFrame> & frames, int begin, int end,
+  const CameraCalib & calib, const SfmParams & p)
+{
+  SfmWindow w = selectBasePair(frames, begin, end, calib, p);
+  if (w.second < 0) {return w;}
+  poseRemainingFrames(frames, begin, end, calib, p, w);
+  addOptionalWindowLandmarks(frames, begin, end, calib, p, w);
+  // Alignment needs poses from at least five frames.
   w.valid = w.pose.size() >= 5;
   return w;
 }
