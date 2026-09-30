@@ -31,7 +31,7 @@ static cv::Mat makeScene(int shift_x)
 
 int main()
 {
-  glassvio::FeatureTracker tracker(1000, 150, 20);
+  glassvio::FeatureTracker tracker{{}};
 
   const auto a = tracker.track(makeScene(0));   // cold start: detect
   assert(a.points.size() == a.ids.size());
@@ -61,7 +61,9 @@ int main()
   // BELOW THE FLOOR, survivors must still FLOW. A floor no scene can meet keeps the count under
   // min_features every frame; the old re-seed branch then handed the survivors back at the
   // PREVIOUS frame's pixels -- 0 px of motion reported for a 3 px shift.
-  glassvio::FeatureTracker starved(1000, 100000, 20);
+  glassvio::FeatureTrackerParams starved_params;
+  starved_params.min_features = 100000;
+  glassvio::FeatureTracker starved(starved_params);
   const auto c = starved.track(makeScene(0));
   const auto d = starved.track(makeScene(3));
   std::size_t moved = 0, common = 0;

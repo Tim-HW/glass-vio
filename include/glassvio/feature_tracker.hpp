@@ -21,6 +21,27 @@ namespace glassvio
 /// pixel here in frame N is the SAME landmark as the pixel there in frame N+1. Without stable
 /// ids there is nothing to triangulate and nothing to reproject. Carrying them costs one
 /// parallel vector; omitting them would force a rewrite the moment the back-end lands.
+/// Everything the tracker is allowed to be tuned by. A struct rather than six positional
+/// constructor arguments, as VisualParams and WindowParams are -- the last two options went in
+/// as `..., 0.0, 0, 15.0f, 0)` at every call site, which is how a wrong one slips through.
+struct FeatureTrackerParams
+{
+  int max_features = 1000;        ///< cap on live tracks (detection stops adding past this)
+  int min_features = 150;         ///< re-detect to top up once live tracks fall below this
+  int fast_threshold = 20;        ///< FAST corner-response threshold
+  /// Keep a track only if flowing it BACK lands within this many pixels of where it started
+  /// (VINS-Fusion's flow_back, 0.5 px); 0 = off. Measured: it cuts ATE by a third on V1_01/V1_02
+  /// and loses V1_03 (doc/08 §6), so it is off here.
+  double flow_back_px = 0.0;
+  /// ...unless fewer than this many tracks would survive the check: in a near-blind stretch the
+  /// last few marginal tracks are what keep the solve alive.
+  int flow_back_min_keep = 0;
+  /// Re-detect on EVERY frame to refill the live tracks to this count (VINS-Fusion: 150) instead
+  /// of waiting for them to fall below min_features. 0 = the floor rule.
+  int top_up_target = 0;
+  float min_spacing_px = 15.0f;   ///< minimum distance between a new corner and a live track
+};
+
 class FeatureTracker
 {
 public:
@@ -30,25 +51,9 @@ public:
     std::vector<long> ids;             ///< persistent landmark id, parallel to points
   };
 
-  /// `max_features` : cap on live tracks (detection stops adding past this)
-  /// `min_features` : re-detect to top up once live tracks fall below this
-  /// `fast_threshold` : FAST corner-response threshold
-  /// `flow_back_px` : keep a track only if flowing it BACK lands within this many pixels of where
-  ///                  it started (VINS-Fusion's flow_back, 0.5 px); 0 = off
-  /// `top_up_target` : when > 0, re-detect on EVERY frame to refill the live tracks to this count
-  ///                   (VINS-Fusion: 150) instead of waiting for them to fall below min_features
-  /// `min_spacing_px` : minimum distance between a new corner and any live track
-  FeatureTracker(
-    int max_features = 1000, int min_features = 150, int fast_threshold = 20,
-    double flow_back_px = 0.0, int top_up_target = 0, float min_spacing_px = 15.0f,
-    int flow_back_min_keep = 0)
-  : max_features_(max_features),
-    min_features_(min_features),
-    flow_back_px_(flow_back_px),
-    top_up_target_(top_up_target),
-    min_spacing_px_(min_spacing_px),
-    flow_back_min_keep_(flow_back_min_keep),
-    detector_(cv::FastFeatureDetector::create(fast_threshold, true)),
+  explicit FeatureTracker(const FeatureTrackerParams & params = {})
+  : p_(params),
+    detector_(cv::FastFeatureDetector::create(params.fast_threshold, true)),
     lk_criteria_(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 30, 0.01)
   {
   }
@@ -81,7 +86,7 @@ public:
       // reconstruction's tracks intact. Supply the map without breaking the geometry it is
       // built on.
       const std::size_t floor = static_cast<std::size_t>(
-        top_up_target_ > 0 ? top_up_target_ : min_features_);
+        p_.top_up_target > 0 ? p_.top_up_target : p_.min_features);
       if (tracked.size() < floor) {
         detectInto(gray, tracked, tracked_ids, cap());
       }
@@ -110,7 +115,7 @@ private:
     // the result back and landing elsewhere says it matched the wrong thing.
     std::vector<cv::Point2f> back;
     std::vector<unsigned char> back_status;
-    if (flow_back_px_ > 0.0 && !next.empty()) {
+    if (p_.flow_back_px > 0.0 && !next.empty()) {
       std::vector<float> back_err;
       back = prev_pts;   // seed the reverse flow at the origin, as VINS-Fusion does
       cv::calcOpticalFlowPyrLK(
@@ -124,9 +129,9 @@ private:
       int consistent = 0;
       for (std::size_t i = 0; i < prev_pts.size(); ++i) {
         consistent += status[i] && back_status[i] &&
-          cv::norm(back[i] - prev_pts[i]) <= flow_back_px_;
+          cv::norm(back[i] - prev_pts[i]) <= p_.flow_back_px;
       }
-      if (consistent < flow_back_min_keep_) {
+      if (consistent < p_.flow_back_min_keep) {
         back.clear();
       }
     }
@@ -138,7 +143,7 @@ private:
         continue;
       }
       if (!back.empty() &&
-        (!back_status[i] || cv::norm(back[i] - prev_pts[i]) > flow_back_px_))
+        (!back_status[i] || cv::norm(back[i] - prev_pts[i]) > p_.flow_back_px))
       {
         continue;
       }
@@ -158,7 +163,7 @@ private:
   /// this call). Each kept corner gets a fresh id.
   std::size_t cap() const
   {
-    return static_cast<std::size_t>(top_up_target_ > 0 ? top_up_target_ : max_features_);
+    return static_cast<std::size_t>(p_.top_up_target > 0 ? p_.top_up_target : p_.max_features);
   }
 
   void detectInto(
@@ -171,13 +176,17 @@ private:
       kps.begin(), kps.end(),
       [](const cv::KeyPoint & a, const cv::KeyPoint & b) {return a.response > b.response;});
 
+    // A plain scan over the live tracks, exiting at the first one too close. A grid was tried
+    // and MEASURED no faster (1.27 vs 1.34 ms a frame; 2.81 vs 2.74 ms topping up to 400): most
+    // candidates sit next to a live track and leave on the first comparison, and FAST plus KLT
+    // dominate the call anyway -- under 3 ms against a 50 ms frame.
     for (const auto & kp : kps) {
       if (pts.size() >= limit) {
         break;
       }
       bool too_close = false;
       for (const auto & q : pts) {
-        if (cv::norm(kp.pt - q) < min_spacing_px_) {
+        if (cv::norm(kp.pt - q) < p_.min_spacing_px) {
           too_close = true;
           break;
         }
@@ -189,12 +198,7 @@ private:
     }
   }
 
-  int max_features_;
-  int min_features_;
-  double flow_back_px_;
-  int top_up_target_;
-  float min_spacing_px_;
-  int flow_back_min_keep_;
+  FeatureTrackerParams p_;
   cv::Ptr<cv::FastFeatureDetector> detector_;
   cv::TermCriteria lk_criteria_;
 

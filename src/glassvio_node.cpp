@@ -63,19 +63,20 @@ public:
       calib_.rectified() ? "rectified" : "radtan (points undistorted at the boundary)",
       calib_.gyro_noise, calib_.accel_noise);
 
-    const int max_features = declare_parameter<int>("features.max", 1000);
-    const int min_features = declare_parameter<int>("features.min", 150);
-    const int fast_threshold = declare_parameter<int>("features.fast_threshold", 20);
+    FeatureTrackerParams tp;
+    tp.max_features = declare_parameter<int>("features.max", tp.max_features);
+    tp.min_features = declare_parameter<int>("features.min", tp.min_features);
+    tp.fast_threshold = declare_parameter<int>("features.fast_threshold", tp.fast_threshold);
     // The VINS-Fusion-style front end (doc/08 §6): off by default -- it cuts ATE by a third on
     // V1_01/V1_02 but loses V1_03 -- so estimator_check's --top-up / --flow-back / --flow-back-keep
     // are reachable here too.
-    const int top_up = declare_parameter<int>("features.top_up", 0);
-    const double flow_back_px = declare_parameter<double>("features.flow_back_px", 0.0);
-    const int flow_back_keep = declare_parameter<int>("features.flow_back_keep", 0);
-    const double min_spacing = declare_parameter<double>("features.min_spacing_px", 15.0);
-    tracker_ = std::make_unique<FeatureTracker>(
-      max_features, min_features, fast_threshold, flow_back_px, top_up,
-      static_cast<float>(min_spacing), flow_back_keep);
+    tp.top_up_target = declare_parameter<int>("features.top_up", tp.top_up_target);
+    tp.flow_back_px = declare_parameter<double>("features.flow_back_px", tp.flow_back_px);
+    tp.flow_back_min_keep =
+      declare_parameter<int>("features.flow_back_keep", tp.flow_back_min_keep);
+    tp.min_spacing_px = static_cast<float>(
+      declare_parameter<double>("features.min_spacing_px", tp.min_spacing_px));
+    tracker_ = std::make_unique<FeatureTracker>(tp);
 
     EstimatorParams ep;
     // TWO SPANS, NOT ONE. `bootstrap_frames` is how much to collect (stage [3]'s bias wants

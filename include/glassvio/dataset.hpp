@@ -264,9 +264,13 @@ public:
 
     rclcpp::Serialization<sensor_msgs::msg::Imu> imu_codec;
     rclcpp::Serialization<sensor_msgs::msg::Image> image_codec;
-    FeatureTracker tracker(
-      1000, 150, opts.fast_threshold, opts.flow_back_px, opts.top_up_target, opts.min_spacing_px,
-      opts.flow_back_min_keep);
+    FeatureTrackerParams tp;
+    tp.fast_threshold = opts.fast_threshold;
+    tp.flow_back_px = opts.flow_back_px;
+    tp.flow_back_min_keep = opts.flow_back_min_keep;
+    tp.top_up_target = opts.top_up_target;
+    tp.min_spacing_px = opts.min_spacing_px;
+    FeatureTracker tracker(tp);
     int n_frames = 0;
 
     while (reader.has_next()) {
