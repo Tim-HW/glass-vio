@@ -13,7 +13,6 @@ namespace glassvio
 namespace
 {
 
-
 Eigen::Matrix3d matFromCv(const cv::Mat & m)
 {
   Eigen::Matrix3d out;
@@ -129,8 +128,7 @@ bool relativeBodyRotation(
     return false;
   }
 
-  const cv::Mat K_cv = (cv::Mat_<double>(3, 3) <<
-    calib.K(0, 0), 0, calib.K(0, 2), 0, calib.K(1, 1), calib.K(1, 2), 0, 0, 1);
+  const cv::Mat K_cv = calib.cvK();
   // STEP 2 -- the essential matrix E relates the two views (x2^T E x1 = 0 for every true pair),
   // fitted by RANSAC so mistracked points do not bend it; then recoverPose decomposes E (an SVD)
   // into a rotation and a translation DIRECTION, picking the one of four solutions that puts the
@@ -166,43 +164,17 @@ SfmWindow selectBasePair(
   SfmWindow w;
   w.base = begin;
 
-  const cv::Mat K_cv = (cv::Mat_<double>(3, 3) <<
-    calib.K(0, 0), 0, calib.K(0, 2), 0, calib.K(1, 1), calib.K(1, 2), 0, 0, 1);
+  const cv::Mat K_cv = calib.cvK();
   const SfmFrame & base = frames[begin];
 
-  // --- A + B. THE BASE PAIR: parallax is only a FILTER; the geometry decides.
-  //
-  // Pixel flow does NOT mean baseline. On a forward-driving car the two are nearly the same
-  // thing, which is why taking the first frame past a flow threshold worked on KITTI. A MAV
-  // ROTATES, and rotation produces flow with a literally zero baseline -- 20 px of it, and
-  // nothing to triangulate. Committing to the first candidate that clears the threshold then
-  // fails the whole window, which is exactly what happened on EuRoC (windows 100/400/800:
-  // "no parallax, too few landmarks").
-  //
-  // VINS-Mono's relativePose() is the fix, and it is one keyword:
-  //
-  //     if (average_parallax * 460 > 30 && m_estimator.solveRelativeRT(corres, R, T))
-  //     { l = i; return true; }                                      // else keep scanning
-  //
-  // The `&&` means a candidate that clears parallax but fails the geometry is silently
-  // skipped and the loop moves on. So we try each candidate END TO END -- essential matrix,
-  // recoverPose, triangulate -- and accept the first that actually yields structure.
-  //
-  // NOT DEROTATION. VINS-Mono's compensatedParallax2() contains a rotation-compensation line
-  // that is COMMENTED OUT (`p_i_comp = p_i;` runs instead), and ORB-SLAM3 does not derotate
-  // either: it runs a homography and a fundamental matrix in parallel and picks on
-  // RH = SH/(SH+SF), which DETECTS the rotation/planar degeneracy rather than stumbling into
-  // it. That is the better answer and the next rung; this is the cheap one.
-  //
-  // min_parallax_deg stays at 1.0 -- ORB-SLAM3 hardcodes exactly that at its call site. The
-  // small baselines here are the selector picking bad pairs, not a threshold to loosen.
+  // Try candidates in time order. Pixel flow alone can come from rotation, so accept a
+  // pair only after essential-matrix recovery and triangulation yield enough landmarks.
   std::vector<cv::Point2f> p1, p2;
   std::vector<long> pair_ids;
   cv::Mat mask, R_cv, t_cv;
   Eigen::Isometry3d T2 = Eigen::Isometry3d::Identity();
 
-  // Try each later frame k as the base frame's partner, nearest first, and take the FIRST that
-  // passes every test below. `continue` means "not this one, try the next frame".
+  // The first candidate that passes every gate wins.
   for (int k = begin + 2; k < end; ++k) {
     // Test 1 -- enough tracks seen in BOTH frames to fit an essential matrix robustly.
     const auto ids = sharedIds(base, frames[k]);

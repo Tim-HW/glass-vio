@@ -15,12 +15,12 @@ namespace glassvio
 namespace
 {
 
-struct Obs
+struct Observation
 {
   int pose;   ///< index into the free-pose list, or -1 for a fixed frame
   int frame;
   int landmark;
-  Eigen::Vector2d z;
+  Eigen::Vector2d pixel;
 };
 
 }  // namespace
@@ -34,7 +34,8 @@ SfmBundleStats bundleAdjust(
     return stats;
   }
 
-  // Cameras as NavStates: the "IMU" is the camera, so the extrinsic is identity.
+  // 1. Pack the reconstruction into camera states and indexed pixel observations.
+  // Reprojection treats each camera as a NavState with identity IMU extrinsic.
   CameraCalib cam = calib;
   cam.T_cam_imu = Eigen::Isometry3d::Identity();
   constexpr double kMinDepth = 1e-6;   // ruler units; cheirality, not a distance gate
@@ -50,6 +51,7 @@ SfmBundleStats bundleAdjust(
     frame_ids.push_back(kv.first);
   }
   std::sort(frame_ids.begin(), frame_ids.end());
+  // The base pose is fixed; the pair pose is fixed unless its direction is being refined.
   std::unordered_map<int, int> free_index;
   for (int k : frame_ids) {
     if (k != w.base && (k != w.second || !fix_pair_frame)) {
@@ -64,7 +66,7 @@ SfmBundleStats bundleAdjust(
     ids.push_back(kv.first);
     landmarks.push_back(kv.second);
   }
-  std::vector<Obs> obs;
+  std::vector<Observation> obs;
   std::vector<int> observation_count(ids.size(), 0);
   for (int k : frame_ids) {
     for (std::size_t l = 0; l < ids.size(); ++l) {
@@ -87,22 +89,24 @@ SfmBundleStats bundleAdjust(
   stats.ran = true;
   stats.observations = static_cast<int>(obs.size());
 
-  // Robust cost and the per-observation pixel errors, at a given state.
+  // 2. Evaluate robust reprojection cost and collect pixel errors for the summary.
   const auto evaluate = [&](
-    const std::unordered_map<int, NavState> & xs, const std::vector<Eigen::Vector3d> & Xs,
-    std::vector<double> * px) {
+    const std::unordered_map<int, NavState> & states, const std::vector<Eigen::Vector3d> & points,
+    std::vector<double> * pixel_errors) {
       double cost = 0.0;
       for (const auto & o : obs) {
         Eigen::Vector3d P_i, P_c;
-        if (!landmarkInCamera(xs.at(o.frame), Xs[o.landmark], cam.T_cam_imu, kMinDepth, P_i, P_c)) {
+        if (!landmarkInCamera(
+            states.at(o.frame), points[o.landmark], cam.T_cam_imu, kMinDepth, P_i, P_c))
+        {
           cost += 2.0 * huber_delta_px * 1e3;   // behind the camera: large, finite
           continue;
         }
-        const double r = reprojectionResidual(P_c, o.z, cam).norm();
-        cost += r <= huber_delta_px ? r * r : 2.0 * huber_delta_px * r - huber_delta_px *
-          huber_delta_px;
-        if (px) {
-          px->push_back(r);
+        const double r = reprojectionResidual(P_c, o.pixel, cam).norm();
+        cost += r <= huber_delta_px ? r * r :
+          2.0 * huber_delta_px * r - huber_delta_px * huber_delta_px;
+        if (pixel_errors) {
+          pixel_errors->push_back(r);
         }
       }
       return cost;
@@ -113,22 +117,25 @@ SfmBundleStats bundleAdjust(
       return v[v.size() / 2];
     };
 
-  std::vector<double> px;
-  double cost = evaluate(camera_states, landmarks, &px);
-  stats.median_px_before = median(px);
+  std::vector<double> pixel_errors;
+  double cost = evaluate(camera_states, landmarks, &pixel_errors);
+  stats.median_px_before = median(pixel_errors);
   stats.median_px_after = stats.median_px_before;
   double lambda = 1e-3;
 
+  // 3. Linearize, eliminate landmarks, then accept or reject each LM step.
   for (int it = 0; it < max_iterations; ++it) {
     // --- Normal equations. H_pp is block-diagonal: an observation touches ONE camera.
-    std::vector<Eigen::Matrix<double, 6, 6>> H_pp(free_pose_count, Eigen::Matrix<double, 6, 6>::Zero());
-    std::vector<Eigen::Matrix<double, 6, 1>> b_p(free_pose_count, Eigen::Matrix<double, 6, 1>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 6>> H_pp(
+      free_pose_count, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_p(
+      free_pose_count, Eigen::Matrix<double, 6, 1>::Zero());
     std::vector<Eigen::Matrix3d> H_ll(landmark_count, Eigen::Matrix3d::Zero());
     std::vector<Eigen::Vector3d> b_l(landmark_count, Eigen::Vector3d::Zero());
     std::vector<Eigen::Matrix<double, 6, 3>> H_pl(obs.size(), Eigen::Matrix<double, 6, 3>::Zero());
 
     for (std::size_t n = 0; n < obs.size(); ++n) {
-      const Obs & o = obs[n];
+      const Observation & o = obs[n];
       if (observation_count[o.landmark] < 2) {
         continue;
       }
@@ -137,7 +144,7 @@ SfmBundleStats bundleAdjust(
       if (!landmarkInCamera(s, landmarks[o.landmark], cam.T_cam_imu, kMinDepth, P_i, P_c)) {
         continue;
       }
-      const PixelResidual r = reprojectionResidual(P_c, o.z, cam);
+      const PixelResidual r = reprojectionResidual(P_c, o.pixel, cam);
       const double wgt = huberWeight(r.norm(), huber_delta_px);
       const PixelJacobian J = reprojectionJacobian(s, P_i, P_c, cam.T_cam_imu, cam);
       Eigen::Matrix<double, 2, 6> Jp;
@@ -153,7 +160,7 @@ SfmBundleStats bundleAdjust(
       }
     }
 
-    // --- Levenberg-Marquardt damping, then eliminate each landmark: S dp = rhs.
+    // Dampen the blocks, then eliminate landmarks: Schur system S dp = rhs.
     Eigen::MatrixXd S = Eigen::MatrixXd::Zero(6 * free_pose_count, 6 * free_pose_count);
     Eigen::VectorXd rhs = Eigen::VectorXd::Zero(6 * free_pose_count);
     for (int i = 0; i < free_pose_count; ++i) {
@@ -188,7 +195,8 @@ SfmBundleStats bundleAdjust(
         }
       }
     }
-    const Eigen::VectorXd dp = free_pose_count > 0 ? Eigen::VectorXd(S.ldlt().solve(rhs)) : Eigen::VectorXd();
+    const Eigen::VectorXd dp = free_pose_count > 0 ?
+      Eigen::VectorXd(S.ldlt().solve(rhs)) : Eigen::VectorXd();
     if (!dp.allFinite()) {
       break;
     }
@@ -228,8 +236,7 @@ SfmBundleStats bundleAdjust(
     }
   }
 
-  // Free pair frame: the scale was left to the damping, so restore the ruler -- the pair's
-  // distance from the base (which sits at the origin) -- by scaling about the origin.
+  // 4. If the pair pose moved, rescale about the fixed base to restore its original ruler.
   const double pair_before = w.pose.at(w.second).inverse().translation().norm();
   const double pair_after = camera_states.at(w.second).p.norm();
   if (!fix_pair_frame && pair_after > 1e-12) {
@@ -242,10 +249,11 @@ SfmBundleStats bundleAdjust(
     }
   }
 
-  px.clear();
-  evaluate(camera_states, landmarks, &px);
-  stats.median_px_after = median(px);
+  pixel_errors.clear();
+  evaluate(camera_states, landmarks, &pixel_errors);
+  stats.median_px_after = median(pixel_errors);
 
+  // Write refined states back in SfM's base-camera pose convention.
   for (const auto & kv : camera_states) {
     Eigen::Isometry3d T_c0_ck = Eigen::Isometry3d::Identity();
     T_c0_ck.linear() = kv.second.R.matrix();
