@@ -11,6 +11,8 @@ reprojection residual**. One solver, two sensors, zero copied Jacobians.
 > subtly-wrong Jacobian can sink a LiDAR odometry and a visual one, it should live in one
 > place, tested once — not copy-pasted and left to drift.
 
+![Visual Odometry System Pipeline](doc/Visual%20Odometry%20System%20Pipeline.png)
+
 ## Docs — a course in visual-inertial SLAM
 
 This repo is written to be **read**, and its docs are structured as a **bottom-up course**: build a
